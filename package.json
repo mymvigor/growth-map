@@ -1,0 +1,29 @@
+{
+  "name": "growth-map",
+  "version": "1.0.0",
+  "description": "A mobile-first personal capability and knowledge system for Obsidian.",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "node esbuild.config.mjs production",
+    "lint": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "keywords": [
+    "obsidian",
+    "capability",
+    "knowledge",
+    "growth"
+  ],
+  "author": "Growth Map",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "builtin-modules": "^4.0.0",
+    "esbuild": "^0.25.0",
+    "obsidian": "^1.8.7",
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.5"
+  }
+}
+

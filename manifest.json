@@ -1,0 +1,10 @@
+{
+  "id": "growth-map",
+  "name": "Growth Map",
+  "version": "1.0.0",
+  "minAppVersion": "1.6.0",
+  "description": "A mobile-first personal capability and knowledge system.",
+  "author": "Growth Map",
+  "isDesktopOnly": false
+}
+
