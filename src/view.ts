@@ -1,5 +1,6 @@
-import { ItemView, MarkdownRenderer, Notice, WorkspaceLeaf, setIcon } from "obsidian";
+import { ItemView, MarkdownRenderer, Notice, Platform, WorkspaceLeaf, setIcon } from "obsidian";
 import { capabilityPath, descendantsOf, progressFor, relativeTime } from "./core";
+import { computeMobileBottomOffset } from "./mobile-layout";
 import {
   CheckpointListModal,
   ContentFormModal,
@@ -37,6 +38,17 @@ export class GrowthMapView extends ItemView {
   private libraryConfidence = "all";
   private refreshTimer: number | null = null;
   private initializing = false;
+  private bottomOffsetFrame: number | null = null;
+  private bottomBarResizeObserver: ResizeObserver | null = null;
+  private bottomBarMutationObserver: MutationObserver | null = null;
+  private observedBottomBars: Element[] = [];
+  private readonly scheduleBottomOffsetUpdate = (): void => {
+    if (this.bottomOffsetFrame !== null) window.cancelAnimationFrame(this.bottomOffsetFrame);
+    this.bottomOffsetFrame = window.requestAnimationFrame(() => {
+      this.bottomOffsetFrame = null;
+      this.updateMobileBottomOffset();
+    });
+  };
 
   constructor(leaf: WorkspaceLeaf, private readonly plugin: GrowthMapPlugin) {
     super(leaf);
@@ -56,11 +68,21 @@ export class GrowthMapView extends ItemView {
 
   async onOpen(): Promise<void> {
     this.contentEl.addClass("growth-map-view");
+    this.setupBottomOffsetTracking();
     await this.render();
+    this.scheduleBottomOffsetUpdate();
   }
 
   async onClose(): Promise<void> {
     if (this.refreshTimer !== null) window.clearTimeout(this.refreshTimer);
+    if (this.bottomOffsetFrame !== null) window.cancelAnimationFrame(this.bottomOffsetFrame);
+    this.bottomBarResizeObserver?.disconnect();
+    this.bottomBarMutationObserver?.disconnect();
+    window.visualViewport?.removeEventListener("resize", this.scheduleBottomOffsetUpdate);
+    window.visualViewport?.removeEventListener("scroll", this.scheduleBottomOffsetUpdate);
+    window.removeEventListener("resize", this.scheduleBottomOffsetUpdate);
+    window.removeEventListener("orientationchange", this.scheduleBottomOffsetUpdate);
+    this.contentEl.style.removeProperty("--gm-mobile-bottom-offset");
     this.contentEl.empty();
   }
 
@@ -109,9 +131,72 @@ export class GrowthMapView extends ItemView {
       else if (this.page === "content") await this.renderContent(scroll);
       this.renderFab(shell);
       this.renderNavigation(shell);
+      this.scheduleBottomOffsetUpdate();
     } catch (error) {
       this.renderError(shell, error);
     }
+  }
+
+  private setupBottomOffsetTracking(): void {
+    window.addEventListener("resize", this.scheduleBottomOffsetUpdate, { passive: true });
+    window.addEventListener("orientationchange", this.scheduleBottomOffsetUpdate, { passive: true });
+    window.visualViewport?.addEventListener("resize", this.scheduleBottomOffsetUpdate, { passive: true });
+    window.visualViewport?.addEventListener("scroll", this.scheduleBottomOffsetUpdate, { passive: true });
+    if (typeof ResizeObserver !== "undefined") this.bottomBarResizeObserver = new ResizeObserver(this.scheduleBottomOffsetUpdate);
+    if (typeof MutationObserver !== "undefined") {
+      this.bottomBarMutationObserver = new MutationObserver(this.scheduleBottomOffsetUpdate);
+      this.bottomBarMutationObserver.observe(document.body, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ["class", "style"]
+      });
+    }
+    this.updateMobileBottomOffset();
+  }
+
+  private updateMobileBottomOffset(): void {
+    const isMobile = Platform.isMobile || document.body.classList.contains("is-mobile")
+      || document.body.classList.contains("emulate-mobile");
+    if (!isMobile) {
+      this.contentEl.style.setProperty("--gm-mobile-bottom-offset", "0px");
+      this.observeBottomBars([]);
+      return;
+    }
+    const viewport = window.visualViewport;
+    const viewportBottom = (viewport?.offsetTop ?? 0) + (viewport?.height ?? window.innerHeight);
+    const safeAreaInset = Number.parseFloat(getComputedStyle(this.contentEl).getPropertyValue("--gm-safe-area-probe")) || 0;
+    const selectors = [
+      ".mobile-navbar",
+      ".mobile-navbar-container",
+      ".mobile-bottom-bar",
+      ".mobile-toolbar",
+      ".workspace-drawer.mod-bottom"
+    ];
+    const candidates = Array.from(document.querySelectorAll(selectors.join(",")))
+      .filter((element: Element) => !this.contentEl.contains(element) && this.isVisibleBottomBar(element));
+    const offset = computeMobileBottomOffset(
+      true,
+      viewportBottom,
+      safeAreaInset,
+      candidates.map((element) => element.getBoundingClientRect())
+    );
+    this.contentEl.style.setProperty("--gm-mobile-bottom-offset", `${offset}px`);
+    this.observeBottomBars(candidates);
+  }
+
+  private isVisibleBottomBar(element: Element): boolean {
+    const style = getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity || "1") > 0 && rect.width > 0 && rect.height > 0;
+  }
+
+  private observeBottomBars(elements: Element[]): void {
+    if (!this.bottomBarResizeObserver) return;
+    if (elements.length === this.observedBottomBars.length && elements.every((element, index) => element === this.observedBottomBars[index])) return;
+    this.bottomBarResizeObserver.disconnect();
+    for (const element of elements) this.bottomBarResizeObserver.observe(element);
+    this.observedBottomBars = elements;
   }
 
   private renderWelcome(container: HTMLElement): void {
@@ -170,7 +255,7 @@ export class GrowthMapView extends ItemView {
     const contents = await this.plugin.repository.loadContentMetadata();
     const active = capabilities.filter((item) => item.status === "active");
     const roots = active.filter((item) => item.parentId === null).sort((a, b) => a.order - b.order);
-    this.renderPageHeader(container, "Your Growth Map", "MY GROWTH", undefined, { icon: "archive", label: "Open archive", run: () => void this.navigate("archive") });
+    this.renderPageHeader(container, "My Growth", "GROWTH MAP", undefined, { icon: "archive", label: "Open archive", run: () => void this.navigate("archive") });
 
     const overview = container.createDiv("gm-overview");
     const overall = progressFor(null, active);
