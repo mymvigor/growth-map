@@ -1104,6 +1104,22 @@ var GrowthMapSettingTab = class extends import_obsidian3.PluginSettingTab {
 
 // src/view.ts
 var import_obsidian4 = require("obsidian");
+
+// src/mobile-layout.ts
+function computeMobileBottomOffset(isMobile, viewportBottom, safeAreaInset, candidates, gap = 8) {
+  if (!isMobile) return 0;
+  const nativeHeight = candidates.reduce((largest, rect) => {
+    const distanceFromBottom = viewportBottom - rect.bottom;
+    const visibleHeight = viewportBottom - rect.top;
+    const isNearViewportBottom = distanceFromBottom >= -2 && distanceFromBottom <= Math.max(96, safeAreaInset + 16);
+    if (!isNearViewportBottom || visibleHeight < 24 || visibleHeight > 180) return largest;
+    return Math.max(largest, visibleHeight);
+  }, 0);
+  const safeInset = Math.max(0, safeAreaInset);
+  return Math.ceil(nativeHeight > 0 ? Math.max(nativeHeight, safeInset) + gap : safeInset);
+}
+
+// src/view.ts
 var VIEW_TYPE_GROWTH_MAP = "growth-map-view";
 var GrowthMapView = class extends import_obsidian4.ItemView {
   constructor(leaf, plugin) {
@@ -1122,6 +1138,17 @@ var GrowthMapView = class extends import_obsidian4.ItemView {
     this.libraryConfidence = "all";
     this.refreshTimer = null;
     this.initializing = false;
+    this.bottomOffsetFrame = null;
+    this.bottomBarResizeObserver = null;
+    this.bottomBarMutationObserver = null;
+    this.observedBottomBars = [];
+    this.scheduleBottomOffsetUpdate = () => {
+      if (this.bottomOffsetFrame !== null) window.cancelAnimationFrame(this.bottomOffsetFrame);
+      this.bottomOffsetFrame = window.requestAnimationFrame(() => {
+        this.bottomOffsetFrame = null;
+        this.updateMobileBottomOffset();
+      });
+    };
   }
   getViewType() {
     return VIEW_TYPE_GROWTH_MAP;
@@ -1134,10 +1161,21 @@ var GrowthMapView = class extends import_obsidian4.ItemView {
   }
   async onOpen() {
     this.contentEl.addClass("growth-map-view");
+    this.setupBottomOffsetTracking();
     await this.render();
+    this.scheduleBottomOffsetUpdate();
   }
   async onClose() {
+    var _a, _b, _c, _d;
     if (this.refreshTimer !== null) window.clearTimeout(this.refreshTimer);
+    if (this.bottomOffsetFrame !== null) window.cancelAnimationFrame(this.bottomOffsetFrame);
+    (_a = this.bottomBarResizeObserver) == null ? void 0 : _a.disconnect();
+    (_b = this.bottomBarMutationObserver) == null ? void 0 : _b.disconnect();
+    (_c = window.visualViewport) == null ? void 0 : _c.removeEventListener("resize", this.scheduleBottomOffsetUpdate);
+    (_d = window.visualViewport) == null ? void 0 : _d.removeEventListener("scroll", this.scheduleBottomOffsetUpdate);
+    window.removeEventListener("resize", this.scheduleBottomOffsetUpdate);
+    window.removeEventListener("orientationchange", this.scheduleBottomOffsetUpdate);
+    this.contentEl.style.removeProperty("--gm-mobile-bottom-offset");
     this.contentEl.empty();
   }
   requestRefresh() {
@@ -1182,9 +1220,68 @@ var GrowthMapView = class extends import_obsidian4.ItemView {
       else if (this.page === "content") await this.renderContent(scroll);
       this.renderFab(shell);
       this.renderNavigation(shell);
+      this.scheduleBottomOffsetUpdate();
     } catch (error) {
       this.renderError(shell, error);
     }
+  }
+  setupBottomOffsetTracking() {
+    var _a, _b;
+    window.addEventListener("resize", this.scheduleBottomOffsetUpdate, { passive: true });
+    window.addEventListener("orientationchange", this.scheduleBottomOffsetUpdate, { passive: true });
+    (_a = window.visualViewport) == null ? void 0 : _a.addEventListener("resize", this.scheduleBottomOffsetUpdate, { passive: true });
+    (_b = window.visualViewport) == null ? void 0 : _b.addEventListener("scroll", this.scheduleBottomOffsetUpdate, { passive: true });
+    if (typeof ResizeObserver !== "undefined") this.bottomBarResizeObserver = new ResizeObserver(this.scheduleBottomOffsetUpdate);
+    if (typeof MutationObserver !== "undefined") {
+      this.bottomBarMutationObserver = new MutationObserver(this.scheduleBottomOffsetUpdate);
+      this.bottomBarMutationObserver.observe(document.body, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ["class", "style"]
+      });
+    }
+    this.updateMobileBottomOffset();
+  }
+  updateMobileBottomOffset() {
+    var _a, _b;
+    const isMobile = import_obsidian4.Platform.isMobile || document.body.classList.contains("is-mobile") || document.body.classList.contains("emulate-mobile");
+    if (!isMobile) {
+      this.contentEl.style.setProperty("--gm-mobile-bottom-offset", "0px");
+      this.observeBottomBars([]);
+      return;
+    }
+    const viewport = window.visualViewport;
+    const viewportBottom = ((_a = viewport == null ? void 0 : viewport.offsetTop) != null ? _a : 0) + ((_b = viewport == null ? void 0 : viewport.height) != null ? _b : window.innerHeight);
+    const safeAreaInset = Number.parseFloat(getComputedStyle(this.contentEl).getPropertyValue("--gm-safe-area-probe")) || 0;
+    const selectors = [
+      ".mobile-navbar",
+      ".mobile-navbar-container",
+      ".mobile-bottom-bar",
+      ".mobile-toolbar",
+      ".workspace-drawer.mod-bottom"
+    ];
+    const candidates = Array.from(document.querySelectorAll(selectors.join(","))).filter((element) => !this.contentEl.contains(element) && this.isVisibleBottomBar(element));
+    const offset = computeMobileBottomOffset(
+      true,
+      viewportBottom,
+      safeAreaInset,
+      candidates.map((element) => element.getBoundingClientRect())
+    );
+    this.contentEl.style.setProperty("--gm-mobile-bottom-offset", `${offset}px`);
+    this.observeBottomBars(candidates);
+  }
+  isVisibleBottomBar(element) {
+    const style = getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity || "1") > 0 && rect.width > 0 && rect.height > 0;
+  }
+  observeBottomBars(elements) {
+    if (!this.bottomBarResizeObserver) return;
+    if (elements.length === this.observedBottomBars.length && elements.every((element, index) => element === this.observedBottomBars[index])) return;
+    this.bottomBarResizeObserver.disconnect();
+    for (const element of elements) this.bottomBarResizeObserver.observe(element);
+    this.observedBottomBars = elements;
   }
   renderWelcome(container) {
     const welcome = container.createDiv("gm-welcome");
@@ -1239,7 +1336,7 @@ var GrowthMapView = class extends import_obsidian4.ItemView {
     const contents = await this.plugin.repository.loadContentMetadata();
     const active = capabilities.filter((item) => item.status === "active");
     const roots = active.filter((item) => item.parentId === null).sort((a, b) => a.order - b.order);
-    this.renderPageHeader(container, "Your Growth Map", "MY GROWTH", void 0, { icon: "archive", label: "Open archive", run: () => void this.navigate("archive") });
+    this.renderPageHeader(container, "My Growth", "GROWTH MAP", void 0, { icon: "archive", label: "Open archive", run: () => void this.navigate("archive") });
     const overview = container.createDiv("gm-overview");
     const overall = progressFor(null, active);
     const overviewCopy = overview.createDiv();
