@@ -1,6 +1,8 @@
 import { ItemView, MarkdownRenderer, Notice, Platform, TFile, WorkspaceLeaf, setIcon } from "obsidian";
 import { capabilityPath, connectionKey, descendantsOf, progressFor, relativeTime, spectrumHue, timeRangeStart } from "./core";
+import { parseContentBlocks, updateRecentCapabilityIds } from "./content-ux";
 import { computeMobileBottomOffset } from "./mobile-layout";
+import { naturalTimelineBuckets, timelineBucketIndex, timelineRangeStart } from "./timeline";
 import {
   CheckpointListModal,
   ContentFormModal,
@@ -24,6 +26,14 @@ import {
 } from "./types";
 
 export const VIEW_TYPE_GROWTH_MAP = "growth-map-view";
+
+const CONTENT_PLURAL_LABELS: Record<Exclude<ContentType, "inbox">, string> = {
+  knowledge: "Knowledge",
+  case: "Cases",
+  lesson: "Lessons",
+  hypothesis: "Hypotheses",
+  question: "Questions"
+};
 
 type LibraryTypeFilter = ContentType | "all";
 
@@ -292,17 +302,6 @@ export class GrowthMapView extends ItemView {
     addArea.createSpan({ text: "Add area" });
     addArea.addEventListener("click", () => void this.addCapability(null));
 
-    const recordedContentIds = new Set(monthEvents.filter((event) => event.eventType === "content-created" && event.contentId).map((event) => event.contentId as string));
-    const legacyNewItems = contents.filter((item) => item.created >= monthStart.toISOString() && !recordedContentIds.has(item.id)).length;
-    const newItems = recordedContentIds.size + legacyNewItems;
-    const stageChanges = monthEvents.filter((event) => event.eventType === "capability-stage-changed").length;
-    const month = container.createEl("button", { cls: "gm-month-card" });
-    const monthText = month.createDiv();
-    monthText.createEl("strong", { text: "This Month" });
-    monthText.createSpan({ text: `${newItems} new item${newItems === 1 ? "" : "s"} · ${stageChanges} stage change${stageChanges === 1 ? "" : "s"}` });
-    const monthArrow = month.createSpan();
-    setIcon(monthArrow, "chevron-right");
-    month.addEventListener("click", () => void this.navigate("timeline"));
 
     const focus = active.filter((item) => item.focus).slice(0, 5);
     this.sectionTitle(container, "Focus", focus.length ? undefined : "Choose up to five capabilities");
@@ -321,6 +320,17 @@ export class GrowthMapView extends ItemView {
       }
     }
 
+    const recordedContentIds = new Set(monthEvents.filter((event) => event.eventType === "content-created" && event.contentId).map((event) => event.contentId as string));
+    const legacyNewItems = contents.filter((item) => item.created >= monthStart.toISOString() && !recordedContentIds.has(item.id)).length;
+    const newItems = recordedContentIds.size + legacyNewItems;
+    const stageChanges = monthEvents.filter((event) => event.eventType === "capability-stage-changed").length;
+    const month = container.createEl("button", { cls: "gm-month-card" });
+    const monthText = month.createDiv();
+    monthText.createEl("strong", { text: "This Month" });
+    monthText.createSpan({ text: `${newItems} new item${newItems === 1 ? "" : "s"} · ${stageChanges} stage change${stageChanges === 1 ? "" : "s"}` });
+    const monthArrow = month.createSpan();
+    setIcon(monthArrow, "chevron-right");
+    month.addEventListener("click", () => void this.navigate("timeline"));
     const activeContents = contents.filter((item) => item.status !== "archived");
     const validationCount = activeContents.filter((item) => item.type === "hypothesis" && item.status === "validating").length;
     const questionCount = activeContents.filter((item) => item.type === "question").length;
@@ -442,20 +452,6 @@ export class GrowthMapView extends ItemView {
     const relevantIds = descendantsOf(capability.id, capabilities);
     relevantIds.add(capability.id);
     const related = contents.filter((item) => item.capabilityIds.some((id) => relevantIds.has(id)));
-    this.sectionTitle(container, "Library");
-    const stats = container.createDiv("gm-stat-grid");
-    for (const type of ["knowledge", "case", "lesson", "hypothesis", "question"] as const) {
-      const count = related.filter((item) => item.type === type).length;
-      const stat = stats.createEl("button", { cls: "gm-stat-card" });
-      stat.createEl("strong", { text: String(count) });
-      stat.createSpan({ text: CONTENT_LABELS[type] });
-      stat.addEventListener("click", () => {
-        this.libraryType = type;
-        this.libraryCapability = capability.id;
-        void this.navigate("library");
-      });
-    }
-
     const recentEvents = (await this.plugin.repository.loadGrowthEvents(timeRangeStart("3m"))).filter((event) =>
       event.capabilityIds.some((id) => relevantIds.has(id))
     ).slice(0, 3);
@@ -468,7 +464,7 @@ export class GrowthMapView extends ItemView {
       (item.strength > 0 || item.pinned) && (item.fromId === capability.id || item.toId === capability.id)
     ).slice(0, 5);
     if (connections.length) {
-      this.sectionTitle(container, "Connected Capabilities");
+      this.sectionTitle(container, "Connected");
       const connectionList = container.createDiv("gm-connected-list");
       for (const connection of connections) {
         const otherId = connection.fromId === capability.id ? connection.toId : connection.fromId;
@@ -484,18 +480,25 @@ export class GrowthMapView extends ItemView {
       }
     }
 
-    this.sectionTitle(container, "Recent Content");
-    const recent = related.sort((a, b) => b.updated.localeCompare(a.updated)).slice(0, 4);
-    if (recent.length) this.renderContentCards(container, recent, capabilities);
-    else this.emptyState(container, "Capture something here and it will be linked automatically.");
-    const add = container.createEl("button", { text: "+  Add", cls: "gm-inline-add" });
-    add.addEventListener("click", () => this.openContentForm([capability.id]));
+    this.sectionTitle(container, "Library");
+    const summary = container.createDiv("gm-library-summary");
+    for (const type of ["knowledge", "case", "lesson", "hypothesis", "question"] as const) {
+      const count = related.filter((item) => item.type === type).length;
+      const stat = summary.createEl("button", { text: `${count} ${count === 1 ? CONTENT_LABELS[type] : CONTENT_PLURAL_LABELS[type]}` });
+      stat.addEventListener("click", () => {
+        this.libraryType = type;
+        this.libraryCapability = capability.id;
+        void this.navigate("library");
+      });
+    }
+    const add = container.createEl("button", { text: "+ Add content", cls: "gm-inline-add" });
+    add.addEventListener("click", () => this.openContentForm([capability.id], undefined, undefined, capability.id));
   }
 
   private async renderTimeline(container: HTMLElement): Promise<void> {
     const capabilities = (await this.plugin.repository.loadCapabilities()).filter((item) => item.status === "active");
     const contents = (await this.plugin.repository.loadContentMetadata()).filter((item) => item.status !== "archived");
-    const start = timeRangeStart(this.timeRange);
+    const start = timelineRangeStart(this.timeRange);
     const events = await this.plugin.repository.loadGrowthEvents(start);
     const recordedContentIds = new Set(events.filter((event) => event.eventType === "content-created" && event.contentId).map((event) => event.contentId as string));
     const activities: TimelineActivity[] = events.map((event) => ({ ...event, recorded: true }));
@@ -519,7 +522,7 @@ export class GrowthMapView extends ItemView {
       button.addEventListener("click", () => { this.timeRange = range; void this.render(); });
     }
 
-    const last30Start = timeRangeStart("30d") as Date;
+    const last30Start = timelineRangeStart("30d") as Date;
     const last30Events = this.timeRange === "30d" ? events : await this.plugin.repository.loadGrowthEvents(last30Start);
     const last30Recorded = new Set(last30Events.filter((event) => event.eventType === "content-created" && event.contentId).map((event) => event.contentId as string));
     const last30Items = last30Recorded.size + contents.filter((item) => item.created >= last30Start.toISOString() && !last30Recorded.has(item.id)).length;
@@ -541,14 +544,25 @@ export class GrowthMapView extends ItemView {
     const roots = capabilities.filter((item) => item.parentId === null).sort((left, right) => left.order - right.order);
     const focus = capabilities.filter((item) => item.focus && item.parentId !== null);
     const rows = [...roots, ...focus].filter((item, index, all) => all.findIndex((candidate) => candidate.id === item.id) === index);
-    const buckets = this.timelineBuckets(start, activities);
+    const earliest = activities.length ? new Date(activities[activities.length - 1].timestamp) : null;
+    const buckets = naturalTimelineBuckets(this.timeRange, new Date(), earliest);
+    const activitiesByBucket = buckets.map(() => [] as TimelineActivity[]);
+    for (const activity of activities) {
+      const index = timelineBucketIndex(activity.timestamp, buckets);
+      if (index >= 0) activitiesByBucket[index].push(activity);
+    }
     this.sectionTitle(container, "Time Map", "activity · stage change");
     if (!activities.length) this.emptyState(container, "Changes recorded from v1.1.0 will appear here.");
     else {
       const map = container.createDiv("gm-time-map");
+      map.style.setProperty("--gm-time-columns", String(buckets.length));
       const header = map.createDiv("gm-time-map-header");
       header.createSpan();
-      for (const bucket of buckets) header.createSpan({ text: bucket.label });
+      for (const bucket of buckets) {
+        const bucketLabel = header.createDiv("gm-time-bucket-label");
+        bucketLabel.createEl("strong", { text: bucket.label });
+        if (bucket.detail) bucketLabel.createSpan({ text: bucket.detail });
+      }
       for (const rowCapability of rows) {
         const row = map.createDiv("gm-time-map-row");
         this.applySpectrum(row, rowCapability.id, capabilities);
@@ -556,9 +570,9 @@ export class GrowthMapView extends ItemView {
         label.addEventListener("click", () => void this.navigate("capability", rowCapability.id));
         const relatedIds = descendantsOf(rowCapability.id, capabilities);
         relatedIds.add(rowCapability.id);
-        for (const bucket of buckets) {
+        for (const [bucketIndex] of buckets.entries()) {
           const cell = row.createDiv("gm-time-cell");
-          const matches = activities.filter((activity) => activity.capabilityIds.some((id) => relatedIds.has(id)) && new Date(activity.timestamp).getTime() >= bucket.start && new Date(activity.timestamp).getTime() < bucket.end);
+          const matches = activitiesByBucket[bucketIndex].filter((activity) => activity.capabilityIds.some((id) => relatedIds.has(id)));
           if (matches.length) {
             const hasStage = matches.some((activity) => activity.eventType === "capability-stage-changed");
             const allRecorded = matches.every((activity) => activity.recorded);
@@ -569,7 +583,7 @@ export class GrowthMapView extends ItemView {
             marker.addEventListener("click", () => void (matches.length === 1
               ? this.showTimelineActivity(matches[0], capabilities, contents)
               : this.showTimelineBucket(matches, capabilities, contents)));
-            if (matches.length > 1) marker.createSpan({ text: `+${matches.length - 1}`, cls: "gm-time-more" });
+            if (matches.length > 1) marker.createSpan({ text: String(matches.length), cls: "gm-time-more" });
           }
         }
       }
@@ -584,7 +598,14 @@ export class GrowthMapView extends ItemView {
     const list = container.createDiv("gm-growth-list");
     let lastDay = "";
     for (const activity of activities.slice(0, 24)) {
-      const day = new Date(activity.timestamp).toLocaleDateString(undefined, { month: "short", day: "numeric" }).toUpperCase();
+      const eventDate = new Date(activity.timestamp);
+      const today = new Date();
+      const yesterday = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 1);
+      const day = eventDate.toDateString() === today.toDateString()
+        ? "TODAY"
+        : eventDate.toDateString() === yesterday.toDateString()
+          ? "YESTERDAY"
+          : eventDate.toLocaleDateString(undefined, { month: "short", day: "numeric" }).toUpperCase();
       if (day !== lastDay) {
         list.createEl("h3", { text: day });
         lastDay = day;
@@ -762,18 +783,19 @@ export class GrowthMapView extends ItemView {
     badges.createSpan({ text: item.status });
     badges.createSpan({ text: `${item.confidence} confidence` });
     badges.createSpan({ text: item.sourceType });
+    const preview = container.createDiv("gm-markdown-preview");
+    await this.renderContentBody(preview, item);
     if (item.capabilityIds.length) {
-      const links = container.createDiv("gm-content-capabilities");
+      const related = container.createDiv("gm-content-related");
+      related.createEl("h2", { text: "Related to" });
+      const links = related.createDiv("gm-content-capabilities");
       for (const id of item.capabilityIds) {
         const capability = capabilities.find((entry) => entry.id === id);
         if (!capability) continue;
-        const button = links.createEl("button", { text: capability.name });
+        const button = links.createEl("button", { text: capabilityPath(capability.id, capabilities).map((entry) => entry.name).join(" / ") });
         button.addEventListener("click", () => void this.navigate("capability", capability.id));
       }
     }
-    const preview = container.createDiv("gm-markdown-preview markdown-rendered");
-    await MarkdownRenderer.render(this.app, item.body, preview, item.file.path, this);
-    await this.renderAttachments(container, item.attachments ?? []);
     const meta = container.createDiv("gm-content-meta");
     meta.createSpan({ text: item.id });
     meta.createSpan({ text: `Updated ${relativeTime(item.updated)}` });
@@ -857,18 +879,35 @@ export class GrowthMapView extends ItemView {
   private async launchQuickCapture(capabilityId?: string): Promise<void> {
     const capabilities = await this.plugin.repository.loadCapabilities();
     const capability = capabilities.find((item) => item.id === capabilityId);
-    new QuickCaptureModal(this.app, capability?.name ?? null, async (title, content, files) => {
-      await this.plugin.repository.createContent({ type: "inbox", title, body: content, capabilityIds: capability ? [capability.id] : [], attachmentFiles: files });
+    new QuickCaptureModal(this.app, capability?.name ?? null, async (title, content, pendingAttachments) => {
+      await this.plugin.repository.createContent({ type: "inbox", title, body: content, capabilityIds: capability ? [capability.id] : [], pendingAttachments });
+      if (capability) await this.rememberCapabilities([capability.id]);
       this.requestRefresh();
     }).open();
   }
 
-  private openContentForm(capabilityIds: string[], initial?: Partial<ContentFormValue>, onSave?: (value: ContentFormValue) => Promise<void>): void {
+  private openContentForm(
+    capabilityIds: string[],
+    initial?: Partial<ContentFormValue>,
+    onSave?: (value: ContentFormValue) => Promise<void>,
+    contextCapabilityId?: string
+  ): void {
     void this.plugin.repository.loadCapabilities().then((capabilities) => {
-      new ContentFormModal(this.app, capabilities, capabilityIds, initial, onSave ?? (async (value) => {
-        await this.plugin.repository.createContent(value);
-        this.requestRefresh();
-      })).open();
+      new ContentFormModal(
+        this.app,
+        capabilities,
+        capabilityIds,
+        initial,
+        onSave ?? (async (value) => {
+          await this.plugin.repository.createContent(value);
+          await this.rememberCapabilities(value.capabilityIds);
+          this.requestRefresh();
+        }),
+        contextCapabilityId,
+        this.plugin.settings.recentCapabilityIds,
+        (ids) => this.saveRecentCapabilities(ids),
+        initial?.body ? "edit" : "new"
+      ).open();
     });
   }
 
@@ -879,19 +918,22 @@ export class GrowthMapView extends ItemView {
       status: "draft",
       confidence: item.confidence,
       sourceType: item.sourceType,
-      type: "knowledge"
+      type: "knowledge",
+      attachments: item.attachments
     }, async (value) => {
       item.body = value.body;
-      const converted = await this.plugin.repository.convertInbox(item, value.type);
+      item.attachments = value.attachments;
+      const converted = await this.plugin.repository.convertInbox(item, value.type, value.pendingAttachments);
       converted.title = value.title;
       converted.capabilityIds = value.capabilityIds;
       converted.status = value.status;
       converted.confidence = value.confidence;
       converted.sourceType = value.sourceType;
       await this.plugin.repository.updateContent(converted);
+      await this.rememberCapabilities(value.capabilityIds);
       this.selectedContentId = converted.id;
       await this.render();
-    }).open();
+    }, undefined, this.plugin.settings.recentCapabilityIds, (ids) => this.saveRecentCapabilities(ids), "organize").open();
   }
 
   private async contentActions(item: LoadedContent, capabilities: Capability[]): Promise<void> {
@@ -915,12 +957,22 @@ export class GrowthMapView extends ItemView {
         item.status = value.status;
         item.confidence = value.confidence;
         item.sourceType = value.sourceType;
-        await this.plugin.repository.updateContent(item);
+        item.attachments = value.attachments;
+        await this.plugin.repository.updateContent(item, value.pendingAttachments);
+        await this.rememberCapabilities(value.capabilityIds);
         await this.render();
-      }).open();
+      }, undefined, this.plugin.settings.recentCapabilityIds, (ids) => this.saveRecentCapabilities(ids), "edit").open();
     }
   }
 
+  private async rememberCapabilities(ids: string[]): Promise<void> {
+    await this.saveRecentCapabilities(updateRecentCapabilityIds(this.plugin.settings.recentCapabilityIds, ids));
+  }
+
+  private async saveRecentCapabilities(ids: string[]): Promise<void> {
+    this.plugin.settings.recentCapabilityIds = ids;
+    await this.plugin.saveSettings();
+  }
   private async addCapability(parentId: string | null): Promise<void> {
     const name = await promptText(this.app, parentId ? "Add child capability" : "Add growth area", "Capability name");
     if (!name) return;
@@ -1153,24 +1205,6 @@ export class GrowthMapView extends ItemView {
     item.createSpan({ text: label });
   }
 
-  private timelineBuckets(start: Date | null, activities: TimelineActivity[]): Array<{ start: number; end: number; label: string }> {
-    const now = Date.now();
-    const activityTimes = activities.map((item) => new Date(item.timestamp).getTime()).filter(Number.isFinite);
-    const startTime = start?.getTime() ?? (activityTimes.length ? Math.min(...activityTimes) : now - 90 * 86400000);
-    const safeStart = Math.min(startTime, now - 86400000);
-    const bucketCount = 6;
-    const step = Math.max(1, (now + 1 - safeStart) / bucketCount);
-    const shortRange = now - safeStart <= 62 * 86400000;
-    return Array.from({ length: bucketCount }, (_, index) => {
-      const bucketStart = safeStart + step * index;
-      const bucketEnd = index === bucketCount - 1 ? now + 1 : safeStart + step * (index + 1);
-      return {
-        start: bucketStart,
-        end: bucketEnd,
-        label: new Date(bucketStart).toLocaleDateString(undefined, shortRange ? { month: "short", day: "numeric" } : { month: "short" })
-      };
-    });
-  }
 
   private activityLabel(activity: TimelineActivity, contents: LoadedContent[]): string {
     const content = activity.contentId ? contents.find((item) => item.id === activity.contentId) : undefined;
@@ -1215,48 +1249,51 @@ export class GrowthMapView extends ItemView {
     const path = activity.capabilityIds.map((id) => capabilityPath(id, capabilities).map((item) => item.name).join(" / ")).filter(Boolean).join(" · ");
     text.createEl("strong", { text: path || "Unlinked content" });
     text.createSpan({ text: this.activityLabel(activity, contents) });
-    row.createSpan({ text: new Date(activity.timestamp).toLocaleDateString(undefined, { month: "short", day: "numeric" }), cls: "gm-muted" });
+    const eventDate = new Date(activity.timestamp);
+    const today = new Date();
+    const sameDay = eventDate.toDateString() === today.toDateString();
+    row.createSpan({
+      text: `${sameDay ? "" : `${eventDate.toLocaleDateString(undefined, { month: "short", day: "numeric" })} · `}${eventDate.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}`,
+      cls: "gm-muted gm-growth-time"
+    });
     marker.setAttribute("aria-hidden", "true");
     row.addEventListener("click", () => void this.showTimelineActivity(activity, capabilities, contents));
   }
 
-  private async renderAttachments(container: HTMLElement, attachments: AttachmentRef[]): Promise<void> {
-    if (!attachments.length) return;
-    this.sectionTitle(container, "Attachments", `${attachments.length}`);
-    const list = container.createDiv("gm-attachment-list");
-    const extra = attachments.length > 3 ? list.createDiv("gm-attachment-extra") : null;
-    attachments.forEach((attachment, index) => {
-      const parent = index < 3 || !extra ? list : extra;
-      const file = this.app.vault.getAbstractFileByPath(attachment.path);
-      const extension = attachment.path.split(".").pop()?.toLocaleLowerCase() ?? "";
-      const isImage = attachment.mimeType?.startsWith("image/") || ["jpg", "jpeg", "png", "webp", "gif"].includes(extension);
-      if (isImage && file instanceof TFile) {
-        const figure = parent.createEl("figure", { cls: "gm-attachment-image" });
-        const image = figure.createEl("img", { attr: { src: this.app.vault.getResourcePath(file), alt: attachment.name, loading: "lazy" } });
-        image.addEventListener("click", () => void this.openAttachment(file));
-        figure.createEl("figcaption", { text: attachment.name });
-        return;
+  private async renderContentBody(container: HTMLElement, item: LoadedContent): Promise<void> {
+    const blocks = parseContentBlocks(item.body, item.attachments ?? []);
+    for (const block of blocks) {
+      if (block.kind === "text") {
+        if (!block.value.trim()) continue;
+        const segment = container.createDiv("gm-markdown-segment markdown-rendered");
+        await MarkdownRenderer.render(this.app, block.value, segment, item.file.path, this);
+        continue;
       }
-      const card = parent.createEl("button", { cls: "gm-attachment-card" });
-      const icon = card.createSpan();
-      setIcon(icon, extension === "pdf" ? "file-text" : extension === "doc" || extension === "docx" ? "file-type-2" : "file");
-      const text = card.createDiv();
-      text.createEl("strong", { text: attachment.name });
-      text.createSpan({ text: file instanceof TFile ? this.formatBytes(file.stat.size) : attachment.path });
-      card.createSpan({ text: "Open", cls: "gm-attachment-open" });
-      if (file instanceof TFile) card.addEventListener("click", () => void this.openAttachment(file));
-      else card.disabled = true;
-    });
-    if (extra) {
-      extra.hidden = true;
-      const show = container.createEl("button", { text: "Show All Attachments", cls: "gm-text-button gm-show-attachments" });
-      show.addEventListener("click", () => {
-        extra.hidden = !extra.hidden;
-        show.setText(extra.hidden ? "Show All Attachments" : "Show Fewer Attachments");
-      });
+      if (block.attachment) this.renderInlineAttachment(container, block.attachment);
     }
   }
 
+  private renderInlineAttachment(container: HTMLElement, attachment: AttachmentRef): void {
+    const file = this.app.vault.getAbstractFileByPath(attachment.path);
+    const extension = attachment.path.split(".").pop()?.toLocaleLowerCase() ?? "";
+    const isImage = attachment.mimeType?.startsWith("image/") || ["jpg", "jpeg", "png", "webp", "gif"].includes(extension);
+    if (isImage && file instanceof TFile) {
+      const figure = container.createEl("figure", { cls: "gm-attachment-image gm-inline-attachment" });
+      const image = figure.createEl("img", { attr: { src: this.app.vault.getResourcePath(file), alt: attachment.name, loading: "lazy" } });
+      image.addEventListener("click", () => void this.openAttachment(file));
+      figure.createEl("figcaption", { text: attachment.name });
+      return;
+    }
+    const card = container.createEl("button", { cls: "gm-attachment-card gm-inline-attachment" });
+    const icon = card.createSpan();
+    setIcon(icon, extension === "pdf" ? "file-text" : extension === "doc" || extension === "docx" ? "file-type-2" : "file");
+    const text = card.createDiv();
+    text.createEl("strong", { text: attachment.name });
+    text.createSpan({ text: `${extension.toUpperCase() || "FILE"}${file instanceof TFile ? ` · ${this.formatBytes(file.stat.size)}` : ""}` });
+    card.createSpan({ text: "Open", cls: "gm-attachment-open" });
+    if (file instanceof TFile) card.addEventListener("click", () => void this.openAttachment(file));
+    else card.disabled = true;
+  }
   private async openAttachment(file: TFile): Promise<void> {
     try {
       await this.app.workspace.getLeaf(true).openFile(file);

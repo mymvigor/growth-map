@@ -78,8 +78,8 @@ export default class GrowthMapPlugin extends Plugin {
       activeView.openQuickCapture();
       return;
     }
-    new QuickCaptureModal(this.app, null, async (title, content, files) => {
-      await this.repository.createContent({ type: "inbox", title, body: content, attachmentFiles: files });
+    new QuickCaptureModal(this.app, null, async (title, content, pendingAttachments) => {
+      await this.repository.createContent({ type: "inbox", title, body: content, pendingAttachments });
     }).open();
   }
 

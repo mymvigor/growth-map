@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { TFile as RuntimeTFile, type App, type TFile } from "obsidian";
+import { pendingAttachmentMarker } from "../src/content-ux";
 import { DEFAULT_SETTINGS } from "../src/types";
 
 class FakeVault {
@@ -186,6 +187,62 @@ Legacy body`);
     expect(second.attachments?.[0].path).not.toBe(first.attachments?.[0].path);
     expect(second.attachments?.[0].path.startsWith("08 Attachments/evidence-")).toBe(true);
     expect(await vault.cachedRead(first.file)).toContain('attachments: [{"path":"08 Attachments/evidence.png"');
+  });
+  it("materializes editor attachment blocks inline and removes references without deleting binaries", async () => {
+    await repository.initialize();
+    const file = {
+      name: "inline evidence.png",
+      type: "image/png",
+      arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer
+    } as File;
+    const token = "pending-inline";
+    const item = await repository.createContent({
+      type: "inbox",
+      body: `Before\n\n${pendingAttachmentMarker(token)}\n\nAfter`,
+      pendingAttachments: [{ token, file }]
+    });
+    const attachmentPath = item.attachments?.[0].path;
+    expect(attachmentPath).toBe("08 Attachments/inline evidence.png");
+    expect(item.body).toBe("Before\n\n![[08 Attachments/inline evidence.png]]\n\nAfter");
+    expect(await vault.cachedRead(item.file)).not.toContain(pendingAttachmentMarker(token));
+
+    item.body = "Before\n\nAfter";
+    item.attachments = [];
+    await repository.updateContent(item);
+    expect(vault.files.has(attachmentPath as string)).toBe(true);
+    expect(await vault.cachedRead(item.file)).not.toContain("08 Attachments/inline evidence.png");
+  });
+
+  it("preserves Inbox text, attachments, and relations when organizing content", async () => {
+    await repository.initialize();
+    const optionality = (await repository.loadCapabilities()).find((item) => item.name === "Optionality");
+    const file = {
+      name: "decision.pdf",
+      type: "application/pdf",
+      arrayBuffer: async () => new Uint8Array([4, 5, 6]).buffer
+    } as File;
+    const token = "pending-convert";
+    const inbox = await repository.createContent({
+      type: "inbox",
+      title: "Original capture",
+      body: `Original text\n\n${pendingAttachmentMarker(token)}`,
+      capabilityIds: [optionality!.id],
+      pendingAttachments: [{ token, file }]
+    });
+    const originalCreated = inbox.created;
+    const converted = await repository.convertInbox(inbox, "lesson");
+    expect(converted.type).toBe("lesson");
+    expect(converted.created).toBe(originalCreated);
+    expect(converted.capabilityIds).toEqual([optionality!.id]);
+    expect(converted.attachments).toHaveLength(1);
+    expect(converted.body).toContain("Original text");
+    expect(converted.body).toContain("![[08 Attachments/decision.pdf]]");
+    expect(converted.body).toContain("# When It Applies");
+    const events = await repository.loadGrowthEvents(null, new Date(Date.now() + 1000), true);
+    expect(events.find((event) => event.eventType === "content-converted" && event.contentId === converted.id)).toMatchObject({
+      capabilityIds: [optionality!.id],
+      metadata: { fromType: "inbox", toType: "lesson" }
+    });
   });
   it("protects references, checkpoints archive, and restores the tree", async () => {
     await repository.initialize();

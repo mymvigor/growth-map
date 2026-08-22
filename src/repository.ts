@@ -1,4 +1,5 @@
 import { normalizePath, TFile, type App } from "obsidian";
+import { attachmentEmbed, pendingAttachmentMarker } from "./content-ux";
 import {
   calculateConnections,
   connectionKey,
@@ -21,6 +22,7 @@ import type {
   GrowthEventType,
   GrowthMapSettings,
   LoadedContent,
+  PendingAttachment,
   SourceType
 } from "./types";
 
@@ -683,17 +685,19 @@ export class GrowthRepository {
     sourceType?: SourceType;
     attachments?: AttachmentRef[];
     attachmentFiles?: File[];
+    pendingAttachments?: PendingAttachment[];
   }): Promise<LoadedContent> {
     await this.ensureFolder(CONTENT_FOLDERS[input.type]);
     const timestamp = nowIso();
     const title = input.title?.trim() ?? "";
     const savedAttachments = input.attachmentFiles?.length ? await this.saveAttachmentFiles(input.attachmentFiles) : [];
-    const attachments = [...(input.attachments ?? []), ...savedAttachments];
+    const materialized = await this.materializePendingAttachments(input.body, input.pendingAttachments ?? []);
+    const attachments = [...(input.attachments ?? []), ...savedAttachments, ...materialized.attachments];
     const item: ContentItem = {
       id: makeId(CONTENT_PREFIXES[input.type]),
       type: input.type,
       title,
-      body: input.type === "inbox" ? input.body.trim() : templateFor(input.type, input.body),
+      body: input.type === "inbox" ? materialized.body.trim() : templateFor(input.type, materialized.body),
       capabilityIds: [...new Set(input.capabilityIds ?? [])],
       status: input.status ?? (input.type === "hypothesis" ? "validating" : "draft"),
       confidence: input.confidence ?? "low",
@@ -713,7 +717,12 @@ export class GrowthRepository {
     return { ...item, file };
   }
 
-  async updateContent(item: LoadedContent): Promise<LoadedContent> {
+  async updateContent(item: LoadedContent, pendingAttachments: PendingAttachment[] = []): Promise<LoadedContent> {
+    if (pendingAttachments.length) {
+      const materialized = await this.materializePendingAttachments(item.body, pendingAttachments);
+      item.body = materialized.body;
+      item.attachments = [...(item.attachments ?? []), ...materialized.attachments];
+    }
     item.updated = nowIso();
     const targetPath = this.contentPath(item);
     if (item.file.path !== targetPath) {
@@ -726,9 +735,14 @@ export class GrowthRepository {
     return item;
   }
 
-  async convertInbox(item: LoadedContent, type: Exclude<ContentType, "inbox">): Promise<LoadedContent> {
+  async convertInbox(item: LoadedContent, type: Exclude<ContentType, "inbox">, pendingAttachments: PendingAttachment[] = []): Promise<LoadedContent> {
     if (item.type !== "inbox") return item;
     const previousId = item.id;
+    if (pendingAttachments.length) {
+      const materialized = await this.materializePendingAttachments(item.body, pendingAttachments);
+      item.body = materialized.body;
+      item.attachments = [...(item.attachments ?? []), ...materialized.attachments];
+    }
     item.type = type;
     item.id = makeId(CONTENT_PREFIXES[type]);
     item.status = type === "hypothesis" ? "validating" : "draft";
@@ -755,6 +769,15 @@ export class GrowthRepository {
     await this.updateContent(item);
   }
 
+  private async materializePendingAttachments(body: string, pending: PendingAttachment[]): Promise<{ body: string; attachments: AttachmentRef[] }> {
+    if (!pending.length) return { body, attachments: [] };
+    const attachments = await this.saveAttachmentFiles(pending.map((item) => item.file));
+    let materializedBody = body;
+    pending.forEach((item, index) => {
+      materializedBody = materializedBody.split(pendingAttachmentMarker(item.token)).join(attachmentEmbed(attachments[index].path));
+    });
+    return { body: materializedBody, attachments };
+  }
   async saveAttachmentFiles(files: File[]): Promise<AttachmentRef[]> {
     const unsupported = files.find((file) => !ALLOWED_ATTACHMENT_EXTENSIONS.has(file.name.split(".").pop()?.toLocaleLowerCase() ?? ""));
     if (unsupported) throw new Error(`Unsupported attachment type: ${unsupported.name}`);
