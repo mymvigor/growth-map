@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { capabilityPath, descendantsOf, makeId, parseSimpleFrontmatter, progressFor, sanitizeFileName, stageProgress } from "../src/core";
+import { calculateConnections, capabilityPath, descendantsOf, makeId, parseSimpleFrontmatter, progressFor, sanitizeFileName, spectrumHue, stageProgress, uniqueAttachmentPath } from "../src/core";
 import type { Capability } from "../src/types";
 
 function capability(input: Partial<Capability> & Pick<Capability, "id" | "name">): Capability {
@@ -63,5 +63,35 @@ describe("Markdown helpers", () => {
   it("creates portable file names and stable-format IDs", () => {
     expect(sanitizeFileName("Risk / Reward: what?" )).toBe("Risk Reward what");
     expect(makeId("CAP", () => 0)).toBe("CAP-AAAAAAAA");
+  });
+});
+describe("v1.1 lightweight derivations", () => {
+  it("calculates shared-item connection strength without inventing semantics", () => {
+    const file = { path: "02 Knowledge/KNOW-1.md", basename: "KNOW-1" } as import("obsidian").TFile;
+    const base = {
+      title: "Shared",
+      status: "draft" as const,
+      confidence: "low" as const,
+      sourceType: "personal-observation" as const,
+      created: "2026-01-01T00:00:00.000Z",
+      updated: "2026-01-01T00:00:00.000Z",
+      body: "Body",
+      file
+    };
+    const result = calculateConnections([
+      { ...base, id: "CASE-1", type: "case", capabilityIds: ["CAP-A", "CAP-B"] },
+      { ...base, id: "LESSON-1", type: "lesson", capabilityIds: ["CAP-B", "CAP-A", "CAP-A"] }
+    ]);
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({ fromId: "CAP-A", toId: "CAP-B", strength: 2, counts: { case: 1, lesson: 1 } });
+  });
+
+  it("creates stable spectrum hues and conflict-safe relative attachment paths", () => {
+    expect(spectrumHue("CAP-OPTIONALITY")).toBe(spectrumHue("CAP-OPTIONALITY"));
+    expect(spectrumHue("CAP-OPTIONALITY")).toBeGreaterThanOrEqual(0);
+    expect(spectrumHue("CAP-OPTIONALITY")).toBeLessThan(360);
+    const occupied = new Set(["08 Attachments/report.pdf", "08 Attachments/report-123.pdf"]);
+    expect(uniqueAttachmentPath("report.pdf", (path) => occupied.has(path), 123)).toBe("08 Attachments/report-123-2.pdf");
+    expect(uniqueAttachmentPath("../unsafe:name.png", () => false, 123)).toBe("08 Attachments/unsafe name.png");
   });
 });

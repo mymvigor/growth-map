@@ -1,11 +1,24 @@
 import { normalizePath, TFile, type App } from "obsidian";
-import { descendantsOf, makeId, parseSimpleFrontmatter, sanitizeFileName } from "./core";
+import {
+  calculateConnections,
+  connectionKey,
+  descendantsOf,
+  makeId,
+  parseSimpleFrontmatter,
+  sanitizeFileName,
+  uniqueAttachmentPath
+} from "./core";
 import type {
+  AttachmentRef,
   Capability,
+  CapabilityConnection,
   Confidence,
   ContentItem,
   ContentStatus,
   ContentType,
+  DerivedConnection,
+  GrowthEvent,
+  GrowthEventType,
   GrowthMapSettings,
   LoadedContent,
   SourceType
@@ -14,6 +27,8 @@ import type {
 export const FOLDERS = [
   "00 System",
   "00 System/Checkpoints",
+  "00 System/Growth Events",
+  "00 System/Connections",
   "01 Capabilities",
   "02 Knowledge",
   "03 Cases",
@@ -21,6 +36,7 @@ export const FOLDERS = [
   "05 Lessons",
   "06 Questions",
   "07 Inbox",
+  "08 Attachments",
   "99 Archive"
 ] as const;
 
@@ -43,6 +59,10 @@ const CONTENT_PREFIXES: Record<ContentType, string> = {
 };
 
 const MANAGED_CONTENT_FOLDERS = Object.values(CONTENT_FOLDERS);
+const GROWTH_EVENT_FOLDER = "00 System/Growth Events";
+const CONNECTION_FOLDER = "00 System/Connections";
+const ATTACHMENT_FOLDER = "08 Attachments";
+const ALLOWED_ATTACHMENT_EXTENSIONS = new Set(["jpg", "jpeg", "png", "webp", "gif", "pdf", "doc", "docx", "txt", "md"]);
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -64,8 +84,33 @@ function stringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 }
 
-function yamlLine(key: string, value: string | number | boolean | null | string[]): string {
+function attachmentArray(value: unknown): AttachmentRef[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const data = item as Record<string, unknown>;
+    const path = stringValue(data.path);
+    const name = stringValue(data.name);
+    const added = stringValue(data.added);
+    if (!path || !name || !added || path.startsWith("/") || /^[A-Za-z]:[\\/]/.test(path) || path.split(/[\\/]/).includes("..")) return [];
+    return [{ path, name, added, mimeType: typeof data.mimeType === "string" ? data.mimeType : undefined }];
+  });
+}
+
+function metadataValue(value: unknown): Record<string, string | number | boolean | null> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const entries = Object.entries(value as Record<string, unknown>).filter((entry): entry is [string, string | number | boolean | null] =>
+    entry[1] === null || ["string", "number", "boolean"].includes(typeof entry[1])
+  );
+  return entries.length ? Object.fromEntries(entries) : undefined;
+}
+
+function yamlLine(key: string, value: string | number | boolean | null | unknown[]): string {
   return `${key}: ${value === null ? "null" : typeof value === "string" || Array.isArray(value) ? JSON.stringify(value) : String(value)}`;
+}
+
+function jsonLine(key: string, value: unknown): string {
+  return `${key}: ${JSON.stringify(value)}`;
 }
 
 function capabilityMarkdown(capability: Capability, existingBody?: string): string {
@@ -108,6 +153,7 @@ function contentMarkdown(item: ContentItem): string {
   ];
   if (item.previousStatus) lines.push(yamlLine("previousStatus", item.previousStatus));
   if (item.demo) lines.push(yamlLine("demo", true));
+  if (item.attachments?.length) lines.push(yamlLine("attachments", item.attachments));
   lines.push("---", "", item.body.trim(), "");
   return lines.join("\n");
 }
@@ -148,6 +194,7 @@ function contentFromData(data: Record<string, unknown>, body: string, file: TFil
     updated: stringValue(data.updated, nowIso()),
     previousStatus: allowedStatuses.includes(data.previousStatus as ContentStatus) ? (data.previousStatus as ContentStatus) : undefined,
     demo: boolValue(data.demo),
+    attachments: attachmentArray(data.attachments),
     body,
     file
   };
@@ -156,6 +203,71 @@ function contentFromData(data: Record<string, unknown>, body: string, file: TFil
 function parseContent(markdown: string, file: TFile): LoadedContent | null {
   const { data, body } = parseSimpleFrontmatter(markdown);
   return contentFromData(data, body, file);
+}
+
+function cloneContent(item: LoadedContent): LoadedContent {
+  return {
+    ...item,
+    capabilityIds: [...item.capabilityIds],
+    attachments: item.attachments?.map((attachment) => ({ ...attachment }))
+  };
+}
+
+function growthEventMarkdown(event: GrowthEvent): string {
+  const lines = [
+    "---",
+    yamlLine("gmType", "growth-event"),
+    yamlLine("id", event.id),
+    yamlLine("timestamp", event.timestamp),
+    yamlLine("eventType", event.eventType),
+    yamlLine("capabilityIds", event.capabilityIds)
+  ];
+  if (event.contentId) lines.push(yamlLine("contentId", event.contentId));
+  if (event.fromStage !== undefined) lines.push(yamlLine("fromStage", event.fromStage));
+  if (event.toStage !== undefined) lines.push(yamlLine("toStage", event.toStage));
+  if (event.metadata) lines.push(jsonLine("metadata", event.metadata));
+  lines.push("---", "", "# Growth Event", "", "Recorded automatically by Growth Map.", "");
+  return lines.join("\n");
+}
+
+function growthEventFromData(data: Record<string, unknown>): GrowthEvent | null {
+  const eventTypes: GrowthEventType[] = ["capability-stage-changed", "content-created", "content-converted", "focus-added", "focus-removed"];
+  if (data.gmType !== "growth-event" || typeof data.id !== "string" || !eventTypes.includes(data.eventType as GrowthEventType)) return null;
+  return {
+    id: data.id,
+    timestamp: stringValue(data.timestamp),
+    eventType: data.eventType as GrowthEventType,
+    capabilityIds: stringArray(data.capabilityIds),
+    contentId: typeof data.contentId === "string" ? data.contentId : undefined,
+    fromStage: typeof data.fromStage === "number" ? data.fromStage : undefined,
+    toStage: typeof data.toStage === "number" ? data.toStage : undefined,
+    metadata: metadataValue(data.metadata)
+  };
+}
+
+function connectionMarkdown(connection: CapabilityConnection): string {
+  const lines = [
+    "---",
+    yamlLine("gmType", "capability-connection"),
+    yamlLine("fromId", connection.fromId),
+    yamlLine("toId", connection.toId),
+    yamlLine("pinned", connection.pinned),
+    yamlLine("created", connection.created)
+  ];
+  if (connection.note) lines.push(yamlLine("note", connection.note));
+  lines.push("---", "", "# Capability Connection", "", "> Observed association. Pinning does not assert causation or dependency.", "");
+  return lines.join("\n");
+}
+
+function connectionFromData(data: Record<string, unknown>): CapabilityConnection | null {
+  if (data.gmType !== "capability-connection" || typeof data.fromId !== "string" || typeof data.toId !== "string") return null;
+  return {
+    fromId: data.fromId,
+    toId: data.toId,
+    pinned: boolValue(data.pinned),
+    note: typeof data.note === "string" ? data.note : undefined,
+    created: stringValue(data.created, nowIso())
+  };
 }
 
 export function templateFor(type: ContentType, seed = ""): string {
@@ -218,6 +330,9 @@ export class GrowthRepository {
   private capabilityCache: Capability[] | null = null;
   private contentCache: LoadedContent[] | null = null;
   private contentMetadataCache: LoadedContent[] | null = null;
+  private growthEventCache = new Map<string, GrowthEvent[]>();
+  private pinnedConnectionCache: CapabilityConnection[] | null = null;
+  private connectionCache: DerivedConnection[] | null = null;
 
   constructor(
     private readonly app: App,
@@ -230,11 +345,17 @@ export class GrowthRepository {
     if (!path || MANAGED_CONTENT_FOLDERS.some((folder) => path.startsWith(`${folder}/`))) {
       this.contentCache = null;
       this.contentMetadataCache = null;
+      this.connectionCache = null;
+    }
+    if (!path || path.startsWith(`${GROWTH_EVENT_FOLDER}/`)) this.growthEventCache.clear();
+    if (!path || path.startsWith(`${CONNECTION_FOLDER}/`)) {
+      this.pinnedConnectionCache = null;
+      this.connectionCache = null;
     }
   }
 
   isManagedPath(path: string): boolean {
-    return path.startsWith("01 Capabilities/") || MANAGED_CONTENT_FOLDERS.some((folder) => path.startsWith(`${folder}/`));
+    return path.startsWith("01 Capabilities/") || MANAGED_CONTENT_FOLDERS.some((folder) => path.startsWith(`${folder}/`)) || path.startsWith(`${GROWTH_EVENT_FOLDER}/`) || path.startsWith(`${CONNECTION_FOLDER}/`);
   }
 
   async isInitialized(): Promise<boolean> {
@@ -319,10 +440,25 @@ export class GrowthRepository {
   }
 
   async updateCapability(capability: Capability, structural = false, label = "Update capability"): Promise<void> {
+    const before = (await this.loadCapabilities()).find((item) => item.id === capability.id);
     if (structural && this.getSettings().checkpointBeforeChanges) await this.createCheckpoint(label);
     capability.updated = nowIso();
     await this.writeCapability(capability);
     this.invalidate();
+    if (before && before.stage !== capability.stage) {
+      await this.recordEventSafely({
+        eventType: "capability-stage-changed",
+        capabilityIds: [capability.id],
+        fromStage: before.stage,
+        toStage: capability.stage
+      });
+    }
+    if (before && before.focus !== capability.focus) {
+      await this.recordEventSafely({
+        eventType: capability.focus ? "focus-added" : "focus-removed",
+        capabilityIds: [capability.id]
+      });
+    }
   }
 
   async moveCapability(id: string, parentId: string | null): Promise<void> {
@@ -497,7 +633,7 @@ export class GrowthRepository {
   }
 
   async loadContents(force = false): Promise<LoadedContent[]> {
-    if (this.contentCache && !force) return this.contentCache.map((item) => ({ ...item, capabilityIds: [...item.capabilityIds] }));
+    if (this.contentCache && !force) return this.contentCache.map(cloneContent);
     const files = this.app.vault
       .getMarkdownFiles()
       .filter((file) => MANAGED_CONTENT_FOLDERS.some((folder) => file.path.startsWith(`${folder}/`)));
@@ -507,11 +643,11 @@ export class GrowthRepository {
       if (item) contents.push(item);
     }
     this.contentCache = contents;
-    return contents.map((item) => ({ ...item, capabilityIds: [...item.capabilityIds] }));
+    return contents.map(cloneContent);
   }
 
   async loadContentMetadata(force = false): Promise<LoadedContent[]> {
-    if (this.contentMetadataCache && !force) return this.contentMetadataCache.map((item) => ({ ...item, capabilityIds: [...item.capabilityIds] }));
+    if (this.contentMetadataCache && !force) return this.contentMetadataCache.map(cloneContent);
     const files = this.app.vault
       .getMarkdownFiles()
       .filter((file) => MANAGED_CONTENT_FOLDERS.some((folder) => file.path.startsWith(`${folder}/`)));
@@ -524,7 +660,7 @@ export class GrowthRepository {
       if (item) contents.push(item);
     }
     this.contentMetadataCache = contents;
-    return contents.map((item) => ({ ...item, capabilityIds: [...item.capabilityIds] }));
+    return contents.map(cloneContent);
   }
 
   async loadContent(id: string): Promise<LoadedContent | null> {
@@ -545,10 +681,14 @@ export class GrowthRepository {
     confidence?: Confidence;
     status?: ContentStatus;
     sourceType?: SourceType;
+    attachments?: AttachmentRef[];
+    attachmentFiles?: File[];
   }): Promise<LoadedContent> {
     await this.ensureFolder(CONTENT_FOLDERS[input.type]);
     const timestamp = nowIso();
     const title = input.title?.trim() ?? "";
+    const savedAttachments = input.attachmentFiles?.length ? await this.saveAttachmentFiles(input.attachmentFiles) : [];
+    const attachments = [...(input.attachments ?? []), ...savedAttachments];
     const item: ContentItem = {
       id: makeId(CONTENT_PREFIXES[input.type]),
       type: input.type,
@@ -559,10 +699,17 @@ export class GrowthRepository {
       confidence: input.confidence ?? "low",
       sourceType: input.sourceType ?? "personal-observation",
       created: timestamp,
-      updated: timestamp
+      updated: timestamp,
+      attachments: attachments.length ? attachments : undefined
     };
     const file = await this.app.vault.create(this.contentPath(item), contentMarkdown(item));
     this.invalidate(file.path);
+    await this.recordEventSafely({
+      eventType: "content-created",
+      capabilityIds: item.capabilityIds,
+      contentId: item.id,
+      metadata: { contentType: item.type }
+    });
     return { ...item, file };
   }
 
@@ -581,11 +728,19 @@ export class GrowthRepository {
 
   async convertInbox(item: LoadedContent, type: Exclude<ContentType, "inbox">): Promise<LoadedContent> {
     if (item.type !== "inbox") return item;
+    const previousId = item.id;
     item.type = type;
     item.id = makeId(CONTENT_PREFIXES[type]);
     item.status = type === "hypothesis" ? "validating" : "draft";
     item.body = templateFor(type, item.body);
-    return this.updateContent(item);
+    const converted = await this.updateContent(item);
+    await this.recordEventSafely({
+      eventType: "content-converted",
+      capabilityIds: item.capabilityIds,
+      contentId: item.id,
+      metadata: { fromType: "inbox", toType: type, previousId }
+    });
+    return converted;
   }
 
   async archiveContent(item: LoadedContent): Promise<void> {
@@ -599,6 +754,117 @@ export class GrowthRepository {
     item.previousStatus = undefined;
     await this.updateContent(item);
   }
+
+  async saveAttachmentFiles(files: File[]): Promise<AttachmentRef[]> {
+    const unsupported = files.find((file) => !ALLOWED_ATTACHMENT_EXTENSIONS.has(file.name.split(".").pop()?.toLocaleLowerCase() ?? ""));
+    if (unsupported) throw new Error(`Unsupported attachment type: ${unsupported.name}`);
+    await this.ensureFolder(ATTACHMENT_FOLDER);
+    const saved: AttachmentRef[] = [];
+    for (const file of files) {
+      const extension = file.name.split(".").pop()?.toLocaleLowerCase() ?? "";
+      if (!ALLOWED_ATTACHMENT_EXTENSIONS.has(extension)) throw new Error(`Unsupported attachment type: ${file.name}`);
+      const path = normalizePath(uniqueAttachmentPath(file.name, (candidate) => Boolean(this.app.vault.getAbstractFileByPath(candidate))));
+      const created = await this.app.vault.createBinary(path, await file.arrayBuffer());
+      saved.push({ path: created.path, name: file.name, mimeType: file.type || undefined, added: nowIso() });
+    }
+    return saved;
+  }
+
+  async recordGrowthEvent(input: Omit<GrowthEvent, "id" | "timestamp"> & Partial<Pick<GrowthEvent, "id" | "timestamp">>): Promise<GrowthEvent> {
+    const event: GrowthEvent = {
+      ...input,
+      id: input.id ?? makeId("EVT"),
+      timestamp: input.timestamp ?? nowIso(),
+      capabilityIds: [...new Set(input.capabilityIds)]
+    };
+    const monthFolder = normalizePath(`${GROWTH_EVENT_FOLDER}/${event.timestamp.slice(0, 7)}`);
+    await this.ensureFolder(GROWTH_EVENT_FOLDER);
+    await this.ensureFolder(monthFolder);
+    const stamp = event.timestamp.replace(/[:.]/g, "-");
+    let path = normalizePath(`${monthFolder}/${stamp} ${event.id}.md`);
+    let suffix = 2;
+    while (this.app.vault.getAbstractFileByPath(path)) {
+      path = normalizePath(`${monthFolder}/${stamp} ${event.id}-${suffix}.md`);
+      suffix += 1;
+    }
+    await this.app.vault.create(path, growthEventMarkdown(event));
+    this.invalidate(path);
+    return event;
+  }
+
+  async loadGrowthEvents(start: Date | null, end = new Date(), force = false): Promise<GrowthEvent[]> {
+    const cacheKey = `${start?.toISOString() ?? "all"}|${end.toISOString()}`;
+    const cached = this.growthEventCache.get(cacheKey);
+    if (cached && !force) return cached.map((event) => ({ ...event, capabilityIds: [...event.capabilityIds], metadata: event.metadata ? { ...event.metadata } : undefined }));
+    const startMonth = start?.toISOString().slice(0, 7);
+    const endMonth = end.toISOString().slice(0, 7);
+    const files = this.app.vault.getMarkdownFiles().filter((file) => {
+      if (!file.path.startsWith(`${GROWTH_EVENT_FOLDER}/`)) return false;
+      const month = file.path.slice(GROWTH_EVENT_FOLDER.length + 1, GROWTH_EVENT_FOLDER.length + 8);
+      return (!startMonth || month >= startMonth) && month <= endMonth;
+    });
+    const events: GrowthEvent[] = [];
+    for (const file of files) {
+      const cachedData = this.app.metadataCache.getFileCache(file)?.frontmatter as Record<string, unknown> | undefined;
+      const data = cachedData ?? parseSimpleFrontmatter(await this.app.vault.cachedRead(file)).data;
+      const event = growthEventFromData(data);
+      if (!event) continue;
+      const time = new Date(event.timestamp).getTime();
+      if ((!start || time >= start.getTime()) && time <= end.getTime()) events.push(event);
+    }
+    events.sort((left, right) => right.timestamp.localeCompare(left.timestamp));
+    this.growthEventCache.set(cacheKey, events);
+    return events.map((event) => ({ ...event, capabilityIds: [...event.capabilityIds], metadata: event.metadata ? { ...event.metadata } : undefined }));
+  }
+
+  async loadPinnedConnections(force = false): Promise<CapabilityConnection[]> {
+    if (this.pinnedConnectionCache && !force) return this.pinnedConnectionCache.map((item) => ({ ...item }));
+    const connections: CapabilityConnection[] = [];
+    for (const file of this.app.vault.getMarkdownFiles().filter((candidate) => candidate.path.startsWith(`${CONNECTION_FOLDER}/`))) {
+      const cached = this.app.metadataCache.getFileCache(file)?.frontmatter as Record<string, unknown> | undefined;
+      const data = cached ?? parseSimpleFrontmatter(await this.app.vault.cachedRead(file)).data;
+      const connection = connectionFromData(data);
+      if (connection) connections.push(connection);
+    }
+    this.pinnedConnectionCache = connections;
+    return connections.map((item) => ({ ...item }));
+  }
+
+  async loadConnections(force = false): Promise<DerivedConnection[]> {
+    if (this.connectionCache && !force) return this.connectionCache.map((item) => ({ ...item, sharedContentIds: [...item.sharedContentIds], counts: { ...item.counts } }));
+    const connections = calculateConnections(await this.loadContentMetadata(), await this.loadPinnedConnections());
+    this.connectionCache = connections;
+    return connections.map((item) => ({ ...item, sharedContentIds: [...item.sharedContentIds], counts: { ...item.counts } }));
+  }
+
+  async pinConnection(firstId: string, secondId: string, pinned: boolean, note?: string): Promise<CapabilityConnection> {
+    if (firstId === secondId) throw new Error("A capability cannot connect to itself");
+    await this.ensureFolder(CONNECTION_FOLDER);
+    const [fromId, toId] = connectionKey(firstId, secondId).split("::");
+    const existing = (await this.loadPinnedConnections()).find((item) => connectionKey(item.fromId, item.toId) === connectionKey(fromId, toId));
+    const connection: CapabilityConnection = {
+      fromId,
+      toId,
+      pinned,
+      note: note?.trim() || existing?.note,
+      created: existing?.created ?? nowIso()
+    };
+    const path = normalizePath(`${CONNECTION_FOLDER}/CONN-${fromId}--${toId}.md`);
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (file instanceof TFile) await this.app.vault.modify(file, connectionMarkdown(connection));
+    else await this.app.vault.create(path, connectionMarkdown(connection));
+    this.invalidate(path);
+    return connection;
+  }
+
+  private async recordEventSafely(input: Omit<GrowthEvent, "id" | "timestamp">): Promise<void> {
+    try {
+      await this.recordGrowthEvent(input);
+    } catch (error) {
+      this.log(`Could not record Growth Event: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
 
   private async moveReferences(sourceIds: string[], targetId: string): Promise<void> {
     const sourceSet = new Set(sourceIds);

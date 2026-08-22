@@ -25,6 +25,13 @@ export interface Capability {
   updated: string;
 }
 
+export interface AttachmentRef {
+  path: string;
+  name: string;
+  mimeType?: string;
+  added: string;
+}
+
 export interface ContentItem {
   id: string;
   type: ContentType;
@@ -38,10 +45,56 @@ export interface ContentItem {
   body: string;
   previousStatus?: ContentStatus;
   demo?: boolean;
+  attachments?: AttachmentRef[];
 }
 
 export interface LoadedContent extends ContentItem {
   file: TFile;
+}
+
+export type GrowthEventType =
+  | "capability-stage-changed"
+  | "content-created"
+  | "content-converted"
+  | "focus-added"
+  | "focus-removed";
+
+export interface GrowthEvent {
+  id: string;
+  timestamp: string;
+  eventType: GrowthEventType;
+  capabilityIds: string[];
+  contentId?: string;
+  fromStage?: number;
+  toStage?: number;
+  metadata?: Record<string, string | number | boolean | null>;
+}
+
+export type TimeRange = "30d" | "3m" | "6m" | "1y" | "all";
+
+export interface CapabilityConnection {
+  fromId: string;
+  toId: string;
+  pinned: boolean;
+  note?: string;
+  created: string;
+}
+
+export interface DerivedConnection extends CapabilityConnection {
+  strength: number;
+  sharedContentIds: string[];
+  counts: Partial<Record<ContentType, number>>;
+}
+
+export interface TimelineActivity {
+  timestamp: string;
+  eventType: GrowthEventType | "historical-content";
+  capabilityIds: string[];
+  contentId?: string;
+  fromStage?: number;
+  toStage?: number;
+  recorded: boolean;
+  metadata?: Record<string, string | number | boolean | null>;
 }
 
 export interface GrowthMapSettings {
@@ -89,5 +142,5 @@ export const SOURCE_TYPES: SourceType[] = [
   "mixed"
 ];
 
-export type MainPage = "home" | "map" | "library" | "ai" | "archive" | "capability" | "content";
+export type MainPage = "home" | "map" | "timeline" | "library" | "ai" | "archive" | "capability" | "content" | "connection";
 

@@ -1,6 +1,6 @@
 {
   "name": "growth-map",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "A mobile-first personal capability and knowledge system for Obsidian.",
   "main": "main.js",
   "scripts": {
