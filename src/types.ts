@@ -32,6 +32,11 @@ export interface AttachmentRef {
   added: string;
 }
 
+export interface PendingAttachment {
+  token: string;
+  file: File;
+}
+
 export interface ContentItem {
   id: string;
   type: ContentType;
@@ -100,6 +105,7 @@ export interface TimelineActivity {
 export interface GrowthMapSettings {
   archiveInsteadOfDelete: boolean;
   checkpointBeforeChanges: boolean;
+  recentCapabilityIds: string[];
   aiEnabled: boolean;
   aiProvider: "none";
   debug: boolean;
@@ -108,6 +114,7 @@ export interface GrowthMapSettings {
 export const DEFAULT_SETTINGS: GrowthMapSettings = {
   archiveInsteadOfDelete: true,
   checkpointBeforeChanges: true,
+  recentCapabilityIds: [],
   aiEnabled: false,
   aiProvider: "none",
   debug: false

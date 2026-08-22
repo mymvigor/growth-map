@@ -214,10 +214,79 @@ function relativeTime(iso, now = Date.now()) {
   return `${Math.floor(months / 12)}y ago`;
 }
 
+// src/content-ux.ts
+var attachmentEmbedPattern = /!\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g;
+function attachmentEmbed(path) {
+  return `![[${path}]]`;
+}
+function pendingAttachmentMarker(token) {
+  return `<!--GM-ATTACH:${token}-->`;
+}
+function parseContentBlocks(body, attachments) {
+  const byPath = new Map(attachments.map((attachment) => [attachment.path, attachment]));
+  const used = /* @__PURE__ */ new Set();
+  const blocks = [];
+  let cursor = 0;
+  let index = 0;
+  for (const match of body.matchAll(attachmentEmbedPattern)) {
+    const path = match[1].trim();
+    const attachment = byPath.get(path);
+    if (!attachment || match.index === void 0) continue;
+    if (match.index > cursor) blocks.push({ id: `text-${index++}`, kind: "text", value: body.slice(cursor, match.index) });
+    blocks.push({ id: `attachment-${index++}`, kind: "attachment", attachment });
+    used.add(path);
+    cursor = match.index + match[0].length;
+  }
+  if (cursor < body.length || blocks.length === 0) blocks.push({ id: `text-${index++}`, kind: "text", value: body.slice(cursor) });
+  for (const attachment of attachments) {
+    if (used.has(attachment.path)) continue;
+    const last = blocks.at(-1);
+    if ((last == null ? void 0 : last.kind) === "text" && last.value && !last.value.endsWith("\n\n")) last.value += last.value.endsWith("\n") ? "\n" : "\n\n";
+    blocks.push({ id: `attachment-${index++}`, kind: "attachment", attachment });
+    blocks.push({ id: `text-${index++}`, kind: "text", value: "\n\n" });
+  }
+  return blocks.length ? blocks : [{ id: "text-0", kind: "text", value: "" }];
+}
+function serializeContentBlocks(blocks) {
+  return blocks.map((block) => {
+    if (block.kind === "text") return block.value;
+    if (block.attachment) return attachmentEmbed(block.attachment.path);
+    return block.pending ? pendingAttachmentMarker(block.pending.token) : "";
+  }).join("").trim();
+}
+function initialRelatedCapabilityIds(initialIds, contextCapabilityId) {
+  return [.../* @__PURE__ */ new Set([...initialIds, ...contextCapabilityId ? [contextCapabilityId] : []])];
+}
+function fullCapabilityPath(capabilityId, capabilities) {
+  return capabilityPath(capabilityId, capabilities).map((item) => item.name).join(" / ");
+}
+function searchCapabilities(capabilities, query, excludedIds = []) {
+  const excluded = new Set(excludedIds);
+  const needle = query.trim().toLocaleLowerCase();
+  if (!needle) return [];
+  return capabilities.filter((capability) => capability.status === "active" && !excluded.has(capability.id)).map((capability) => ({ capability, path: fullCapabilityPath(capability.id, capabilities).toLocaleLowerCase() })).filter(({ capability, path }) => capability.name.toLocaleLowerCase().includes(needle) || path.includes(needle)).sort((left, right) => {
+    const leftName = left.capability.name.toLocaleLowerCase();
+    const rightName = right.capability.name.toLocaleLowerCase();
+    return Number(!leftName.startsWith(needle)) - Number(!rightName.startsWith(needle)) || left.path.length - right.path.length || left.path.localeCompare(right.path);
+  }).map(({ capability }) => capability);
+}
+function updateRecentCapabilityIds(current, usedIds, limit = 8) {
+  return [.../* @__PURE__ */ new Set([...usedIds, ...current])].slice(0, limit);
+}
+function suggestedCapabilities(capabilities, contextCapabilityId, excludedIds, limit = 3) {
+  if (!contextCapabilityId) return [];
+  const excluded = new Set(excludedIds);
+  const context = capabilities.find((item) => item.id === contextCapabilityId && item.status === "active");
+  if (!context) return [];
+  const siblings = capabilities.filter((item) => item.status === "active" && item.parentId === context.parentId && item.id !== context.id);
+  return [context, ...siblings].filter((item) => !excluded.has(item.id)).slice(0, limit);
+}
+
 // src/types.ts
 var DEFAULT_SETTINGS = {
   archiveInsteadOfDelete: true,
   checkpointBeforeChanges: true,
+  recentCapabilityIds: [],
   aiEnabled: false,
   aiProvider: "none",
   debug: false
@@ -256,7 +325,66 @@ function promptText(app, title, placeholder, initial = "") {
 function chooseOption(app, title, options) {
   return new Promise((resolve) => new ChoiceModal(app, title, options, resolve).open());
 }
-var TextPromptModal = class extends import_obsidian.Modal {
+var GrowthModal = class extends import_obsidian.Modal {
+  constructor() {
+    super(...arguments);
+    this.viewportCleanup = null;
+  }
+  prepareModal(...classes) {
+    this.modalEl.addClass("gm-modal", ...classes);
+    const viewport = window.visualViewport;
+    const container = this.modalEl.closest(".modal-container");
+    const update = () => {
+      var _a, _b;
+      const height = (_a = viewport == null ? void 0 : viewport.height) != null ? _a : window.innerHeight;
+      const top = (_b = viewport == null ? void 0 : viewport.offsetTop) != null ? _b : 0;
+      this.modalEl.style.setProperty("--gm-visible-viewport-height", `${height}px`);
+      this.modalEl.style.setProperty("--gm-visible-viewport-top", `${top}px`);
+      if (container) {
+        container.addClass("gm-modal-viewport");
+        container.style.top = `${top}px`;
+        container.style.height = `${height}px`;
+        container.style.bottom = "auto";
+      }
+    };
+    const focus = (event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLElement) || !target.matches("input, textarea, select, [contenteditable=true]")) return;
+      window.setTimeout(() => {
+        var _a, _b;
+        const top = (_a = viewport == null ? void 0 : viewport.offsetTop) != null ? _a : 0;
+        const bottom = top + ((_b = viewport == null ? void 0 : viewport.height) != null ? _b : window.innerHeight) - 76;
+        const rect = target.getBoundingClientRect();
+        if (rect.top < top + 12 || rect.bottom > bottom) target.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      }, 80);
+    };
+    update();
+    viewport == null ? void 0 : viewport.addEventListener("resize", update, { passive: true });
+    viewport == null ? void 0 : viewport.addEventListener("scroll", update, { passive: true });
+    window.addEventListener("resize", update, { passive: true });
+    this.contentEl.addEventListener("focusin", focus);
+    this.viewportCleanup = () => {
+      viewport == null ? void 0 : viewport.removeEventListener("resize", update);
+      viewport == null ? void 0 : viewport.removeEventListener("scroll", update);
+      window.removeEventListener("resize", update);
+      this.contentEl.removeEventListener("focusin", focus);
+      this.modalEl.style.removeProperty("--gm-visible-viewport-height");
+      this.modalEl.style.removeProperty("--gm-visible-viewport-top");
+      if (container) {
+        container.removeClass("gm-modal-viewport");
+        container.style.removeProperty("top");
+        container.style.removeProperty("height");
+        container.style.removeProperty("bottom");
+      }
+    };
+  }
+  finishModal() {
+    var _a;
+    (_a = this.viewportCleanup) == null ? void 0 : _a.call(this);
+    this.viewportCleanup = null;
+  }
+};
+var TextPromptModal = class extends GrowthModal {
   constructor(app, title, placeholder, initial, resolve) {
     super(app);
     this.title = title;
@@ -266,7 +394,7 @@ var TextPromptModal = class extends import_obsidian.Modal {
     this.settled = false;
   }
   onOpen() {
-    this.modalEl.addClass("gm-modal");
+    this.prepareModal();
     this.contentEl.createEl("h2", { text: this.title });
     const input = this.contentEl.createEl("input", { cls: "gm-text-input", attr: { type: "text", placeholder: this.placeholder } });
     input.value = this.initial;
@@ -287,11 +415,12 @@ var TextPromptModal = class extends import_obsidian.Modal {
     window.setTimeout(() => input.focus(), 50);
   }
   onClose() {
+    this.finishModal();
     this.contentEl.empty();
     if (!this.settled) this.resolve(null);
   }
 };
-var ChoiceModal = class extends import_obsidian.Modal {
+var ChoiceModal = class extends GrowthModal {
   constructor(app, title, options, resolve) {
     super(app);
     this.title = title;
@@ -300,7 +429,7 @@ var ChoiceModal = class extends import_obsidian.Modal {
     this.settled = false;
   }
   onOpen() {
-    this.modalEl.addClass("gm-modal", "gm-choice-modal");
+    this.prepareModal("gm-choice-modal");
     this.contentEl.createEl("h2", { text: this.title });
     const list = this.contentEl.createDiv("gm-choice-list");
     for (const option of this.options) {
@@ -316,62 +445,305 @@ var ChoiceModal = class extends import_obsidian.Modal {
     this.contentEl.createEl("button", { text: "Cancel", cls: "gm-cancel-button" }).addEventListener("click", () => this.close());
   }
   onClose() {
+    this.finishModal();
     this.contentEl.empty();
     if (!this.settled) this.resolve(null);
   }
 };
-var QuickCaptureModal = class extends import_obsidian.Modal {
+var ContentComposer = class {
+  constructor(app, container, body, attachments) {
+    this.app = app;
+    this.container = container;
+    this.activeTextId = null;
+    this.selectionStart = 0;
+    this.selectionEnd = 0;
+    this.tokenCounter = 0;
+    this.previewUrls = /* @__PURE__ */ new Map();
+    this.blocks = parseContentBlocks(body, attachments);
+    this.render();
+  }
+  value() {
+    return {
+      body: serializeContentBlocks(this.blocks),
+      attachments: this.blocks.flatMap((block) => block.kind === "attachment" && block.attachment ? [block.attachment] : []),
+      pendingAttachments: this.blocks.flatMap((block) => block.kind === "attachment" && block.pending ? [block.pending] : [])
+    };
+  }
+  destroy() {
+    for (const url of this.previewUrls.values()) URL.revokeObjectURL(url);
+    this.previewUrls.clear();
+  }
+  render() {
+    this.container.empty();
+    this.blocks.forEach((block, index) => {
+      if (block.kind === "text") this.renderText(block, index);
+      else this.renderAttachment(block, index);
+    });
+    const addRow = this.container.createDiv("gm-composer-add-row");
+    this.fileButton(addRow, "Image", "image", ".jpg,.jpeg,.png,.webp,.gif,image/*");
+    this.fileButton(addRow, "File", "file", ".pdf,.doc,.docx,.txt,.md,application/pdf,text/plain,text/markdown");
+  }
+  renderText(block, index) {
+    const textarea = this.container.createEl("textarea", {
+      cls: "gm-composer-text",
+      attr: {
+        placeholder: index === 0 ? "What do you want to remember?" : "Continue writing\u2026",
+        rows: index === 0 ? "7" : "3",
+        "data-gm-block-id": block.id
+      }
+    });
+    textarea.value = block.value;
+    const rememberSelection = () => {
+      this.activeTextId = block.id;
+      this.selectionStart = textarea.selectionStart;
+      this.selectionEnd = textarea.selectionEnd;
+    };
+    textarea.addEventListener("focus", rememberSelection);
+    textarea.addEventListener("select", rememberSelection);
+    textarea.addEventListener("click", rememberSelection);
+    textarea.addEventListener("input", () => {
+      block.value = textarea.value;
+      rememberSelection();
+      textarea.style.height = "auto";
+      textarea.style.height = `${Math.max(96, textarea.scrollHeight)}px`;
+    });
+    window.setTimeout(() => {
+      textarea.style.height = "auto";
+      textarea.style.height = `${Math.max(96, textarea.scrollHeight)}px`;
+    }, 0);
+  }
+  renderAttachment(block, index) {
+    var _a, _b, _c, _d, _e;
+    const attachment = block.attachment;
+    const pending = block.pending;
+    const name = (_b = (_a = attachment == null ? void 0 : attachment.name) != null ? _a : pending == null ? void 0 : pending.file.name) != null ? _b : "Attachment";
+    const mimeType = (_d = (_c = attachment == null ? void 0 : attachment.mimeType) != null ? _c : pending == null ? void 0 : pending.file.type) != null ? _d : "";
+    const isImage = mimeType.startsWith("image/") || /\.(jpe?g|png|webp|gif)$/i.test(name);
+    const card = this.container.createDiv(`gm-composer-attachment${isImage ? " is-image" : ""}`);
+    if (isImage) {
+      const url = this.previewUrl(block);
+      if (url) card.createEl("img", { attr: { src: url, alt: name } });
+    } else {
+      const icon = card.createSpan("gm-composer-file-icon");
+      (0, import_obsidian.setIcon)(icon, /\.pdf$/i.test(name) ? "file-text" : "file");
+    }
+    const text = card.createDiv("gm-composer-attachment-copy");
+    text.createEl("strong", { text: name });
+    const size = (_e = pending == null ? void 0 : pending.file.size) != null ? _e : attachment ? this.attachmentSize(attachment) : 0;
+    text.createSpan({ text: `${this.fileKind(name)}${size ? ` \xB7 ${this.formatBytes(size)}` : ""}` });
+    const remove = card.createEl("button", { cls: "gm-composer-remove", attr: { "aria-label": `Remove ${name} from content` } });
+    (0, import_obsidian.setIcon)(remove, "x");
+    remove.addEventListener("click", () => {
+      this.blocks.splice(index, 1);
+      this.mergeTextBlocks();
+      this.render();
+    });
+  }
+  fileButton(container, label, kind, accept) {
+    const input = container.createEl("input", { cls: "gm-file-input", attr: { type: "file", accept } });
+    input.multiple = true;
+    const button = container.createEl("button", { text: `+ ${label}`, cls: "gm-composer-add" });
+    button.addEventListener("click", () => input.click());
+    input.addEventListener("change", () => {
+      var _a;
+      const files = Array.from((_a = input.files) != null ? _a : []);
+      if (files.length) this.insertFiles(files, kind);
+      input.value = "";
+    });
+  }
+  insertFiles(files, kind) {
+    var _a, _b;
+    const valid = files.filter((file) => kind === "image" ? /\.(jpe?g|png|webp|gif)$/i.test(file.name) : /\.(pdf|docx?|txt|md)$/i.test(file.name));
+    if (!valid.length) {
+      new import_obsidian.Notice(kind === "image" ? "Choose an image file" : "Choose a PDF, Word, text, or Markdown file");
+      return;
+    }
+    let index = this.blocks.findIndex((block) => block.kind === "text" && block.id === this.activeTextId);
+    if (index < 0) index = this.blocks.map((block) => block.kind).lastIndexOf("text");
+    if (index < 0) {
+      this.blocks.push({ id: this.nextId("text"), kind: "text", value: "" });
+      index = this.blocks.length - 1;
+    }
+    const text = this.blocks[index];
+    const start = this.activeTextId === text.id ? this.selectionStart : text.value.length;
+    const end = this.activeTextId === text.id ? this.selectionEnd : text.value.length;
+    const before = text.value.slice(0, start);
+    const after = text.value.slice(end);
+    const replacement = [
+      { id: text.id, kind: "text", value: before ? `${before.replace(/\s*$/, "")}
+
+` : "" },
+      ...valid.map((file) => ({ id: this.nextId("attachment"), kind: "attachment", pending: { token: this.nextId("pending"), file } })),
+      { id: this.nextId("text"), kind: "text", value: after ? `
+
+${after.replace(/^\s*/, "")}` : "\n\n" }
+    ];
+    this.blocks.splice(index, 1, ...replacement);
+    this.activeTextId = (_b = (_a = replacement.at(-1)) == null ? void 0 : _a.id) != null ? _b : null;
+    this.selectionStart = 0;
+    this.selectionEnd = 0;
+    this.render();
+    window.setTimeout(() => {
+      var _a2, _b2;
+      return (_b2 = this.container.querySelector(`[data-gm-block-id="${(_a2 = this.activeTextId) != null ? _a2 : ""}"]`)) == null ? void 0 : _b2.focus();
+    }, 30);
+  }
+  previewUrl(block) {
+    if (block.pending) {
+      const existing = this.previewUrls.get(block.pending.token);
+      if (existing) return existing;
+      if (typeof URL.createObjectURL !== "function") return null;
+      const url = URL.createObjectURL(block.pending.file);
+      this.previewUrls.set(block.pending.token, url);
+      return url;
+    }
+    const file = block.attachment ? this.app.vault.getAbstractFileByPath(block.attachment.path) : null;
+    return file instanceof import_obsidian.TFile ? this.app.vault.getResourcePath(file) : null;
+  }
+  attachmentSize(attachment) {
+    const file = this.app.vault.getAbstractFileByPath(attachment.path);
+    return file instanceof import_obsidian.TFile ? file.stat.size : 0;
+  }
+  mergeTextBlocks() {
+    for (let index = this.blocks.length - 2; index >= 0; index -= 1) {
+      const left = this.blocks[index];
+      const right = this.blocks[index + 1];
+      if (left.kind === "text" && right.kind === "text") {
+        left.value += right.value;
+        this.blocks.splice(index + 1, 1);
+      }
+    }
+    if (!this.blocks.some((block) => block.kind === "text")) this.blocks.push({ id: this.nextId("text"), kind: "text", value: "" });
+  }
+  nextId(prefix) {
+    this.tokenCounter += 1;
+    return `${prefix}-${Date.now().toString(36)}-${this.tokenCounter}`;
+  }
+  fileKind(name) {
+    var _a;
+    return ((_a = name.split(".").pop()) == null ? void 0 : _a.toLocaleUpperCase()) || "FILE";
+  }
+  formatBytes(bytes) {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+};
+var CapabilityPickerModal = class extends GrowthModal {
+  constructor(app, capabilities, selectedIds, contextCapabilityId, recentCapabilityIds, onPick) {
+    super(app);
+    this.capabilities = capabilities;
+    this.selectedIds = selectedIds;
+    this.contextCapabilityId = contextCapabilityId;
+    this.recentCapabilityIds = recentCapabilityIds;
+    this.onPick = onPick;
+    this.expanded = /* @__PURE__ */ new Set();
+  }
+  onOpen() {
+    this.prepareModal("gm-capability-picker-modal");
+    this.contentEl.createEl("h2", { text: "Add related capability" });
+    const search = this.contentEl.createEl("input", { cls: "gm-text-input gm-capability-search", attr: { type: "search", placeholder: "Search capabilities\u2026" } });
+    const results = this.contentEl.createDiv("gm-picker-content");
+    const render = () => {
+      results.empty();
+      const query = search.value.trim();
+      if (query) {
+        this.pickerSection(results, "Results", searchCapabilities(this.capabilities, query, this.selectedIds).slice(0, 30));
+        if (!results.childElementCount) results.createDiv({ text: "No matching capabilities", cls: "gm-picker-empty" });
+        return;
+      }
+      this.pickerSection(results, "Suggested", suggestedCapabilities(this.capabilities, this.contextCapabilityId, this.selectedIds));
+      this.pickerSection(results, "Focus", this.capabilities.filter((item) => item.status === "active" && item.focus && !this.selectedIds.has(item.id)).slice(0, 5));
+      const recent = this.recentCapabilityIds.map((id) => this.capabilities.find((item) => item.id === id)).filter((item) => Boolean(item && item.status === "active" && !this.selectedIds.has(item.id))).slice(0, 5);
+      this.pickerSection(results, "Recent", recent);
+      const browse = results.createEl("button", { text: this.expanded.size ? "Hide All" : "Browse All", cls: "gm-picker-browse" });
+      browse.addEventListener("click", () => {
+        if (this.expanded.size) this.expanded.clear();
+        else for (const root of this.childrenOf(null)) this.expanded.add(root.id);
+        render();
+      });
+      if (this.expanded.size) {
+        const tree = results.createDiv("gm-picker-tree");
+        for (const root of this.childrenOf(null)) this.renderTreeNode(tree, root, 0, render);
+      }
+    };
+    search.addEventListener("input", render);
+    render();
+    window.setTimeout(() => search.focus(), 50);
+  }
+  pickerSection(container, title, capabilities) {
+    if (!capabilities.length) return;
+    container.createEl("h3", { text: title });
+    for (const capability of capabilities) this.capabilityButton(container, capability);
+  }
+  capabilityButton(container, capability, depth = 0) {
+    const button = container.createEl("button", { cls: "gm-picker-row" });
+    button.style.setProperty("--gm-picker-depth", String(Math.min(depth, 4)));
+    button.createEl("strong", { text: capability.name });
+    button.createSpan({ text: fullCapabilityPath(capability.id, this.capabilities) });
+    button.addEventListener("click", () => {
+      this.onPick(capability.id);
+      this.close();
+    });
+  }
+  renderTreeNode(container, capability, depth, rerender) {
+    const children = this.childrenOf(capability.id);
+    const row = container.createDiv("gm-picker-tree-row");
+    row.style.setProperty("--gm-picker-depth", String(Math.min(depth, 4)));
+    const toggle = row.createEl("button", { cls: "gm-picker-toggle", attr: { "aria-label": children.length ? "Expand or collapse" : "No children" } });
+    if (children.length) (0, import_obsidian.setIcon)(toggle, this.expanded.has(capability.id) ? "chevron-down" : "chevron-right");
+    else toggle.disabled = true;
+    toggle.addEventListener("click", () => {
+      if (this.expanded.has(capability.id)) this.expanded.delete(capability.id);
+      else this.expanded.add(capability.id);
+      rerender();
+    });
+    this.capabilityButton(row, capability, depth);
+    if (children.length && this.expanded.has(capability.id)) for (const child of children) this.renderTreeNode(container, child, depth + 1, rerender);
+  }
+  childrenOf(parentId) {
+    return this.capabilities.filter((item) => item.status === "active" && item.parentId === parentId).sort((left, right) => left.order - right.order || left.name.localeCompare(right.name));
+  }
+  onClose() {
+    this.finishModal();
+    this.contentEl.empty();
+  }
+};
+var QuickCaptureModal = class extends GrowthModal {
   constructor(app, contextName, onSave) {
     super(app);
     this.contextName = contextName;
     this.onSave = onSave;
-    this.selectedFiles = [];
+    this.composer = null;
   }
   onOpen() {
-    this.modalEl.addClass("gm-modal", "gm-capture-modal");
+    this.prepareModal("gm-capture-modal");
     this.contentEl.createEl("h2", { text: "Record something" });
-    if (this.contextName) this.contentEl.createDiv({ text: `Linked to ${this.contextName}`, cls: "gm-context-pill" });
-    const textarea = this.contentEl.createEl("textarea", {
-      cls: "gm-capture-input",
-      attr: { placeholder: "What's worth remembering?", rows: "8" }
-    });
+    if (this.contextName) this.contentEl.createDiv({ text: `Related to ${this.contextName}`, cls: "gm-context-pill" });
     const details = this.contentEl.createEl("details", { cls: "gm-optional-title" });
     details.createEl("summary", { text: "Add a title (optional)" });
     const title = details.createEl("input", { cls: "gm-text-input", attr: { type: "text", placeholder: "Title" } });
-    const attachmentInput = this.contentEl.createEl("input", {
-      cls: "gm-file-input",
-      attr: {
-        type: "file",
-        accept: ".jpg,.jpeg,.png,.webp,.gif,.pdf,.doc,.docx,.txt,.md,image/jpeg,image/png,image/webp,image/gif,application/pdf,text/plain,text/markdown"
-      }
-    });
-    attachmentInput.multiple = true;
-    const attachmentRow = this.contentEl.createDiv("gm-capture-attachment-row");
-    const addAttachment = attachmentRow.createEl("button", { text: "Add Attachment", cls: "gm-attachment-picker" });
-    const attachmentSummary = attachmentRow.createSpan({ text: "Optional", cls: "gm-muted" });
-    addAttachment.addEventListener("click", () => attachmentInput.click());
-    attachmentInput.addEventListener("change", () => {
-      var _a;
-      this.selectedFiles = Array.from((_a = attachmentInput.files) != null ? _a : []);
-      attachmentSummary.setText(this.selectedFiles.length ? `${this.selectedFiles.length} selected` : "Optional");
-    });
+    const composerHost = this.contentEl.createDiv("gm-composer");
+    this.composer = new ContentComposer(this.app, composerHost, "", []);
     const actions = this.contentEl.createDiv("gm-modal-actions");
     actions.createEl("button", { text: "Cancel" }).addEventListener("click", () => this.close());
     const save = actions.createEl("button", { text: "Save to Inbox", cls: "mod-cta" });
-    save.addEventListener("click", () => void this.submit(title.value, textarea.value, save));
-    textarea.addEventListener("keydown", (event) => {
-      if ((event.metaKey || event.ctrlKey) && event.key === "Enter") void this.submit(title.value, textarea.value, save);
-    });
-    window.setTimeout(() => textarea.focus(), 50);
+    save.addEventListener("click", () => void this.submit(title.value, save));
+    window.setTimeout(() => {
+      var _a;
+      return (_a = composerHost.querySelector(".gm-composer-text")) == null ? void 0 : _a.focus();
+    }, 50);
   }
-  async submit(title, content, button) {
-    if (!content.trim()) {
-      new import_obsidian.Notice("Write something first");
+  async submit(title, button) {
+    var _a, _b;
+    const value = (_b = (_a = this.composer) == null ? void 0 : _a.value()) != null ? _b : { body: "", pendingAttachments: [] };
+    if (!value.body && !title.trim() && !value.pendingAttachments.length) {
+      new import_obsidian.Notice("Write something or add an attachment first");
       return;
     }
     button.disabled = true;
     try {
-      await this.onSave(title.trim(), content.trim(), this.selectedFiles);
+      await this.onSave(title.trim(), value.body, value.pendingAttachments);
       this.close();
       new import_obsidian.Notice("Saved to Growth Map Inbox");
     } catch (error) {
@@ -380,39 +752,80 @@ var QuickCaptureModal = class extends import_obsidian.Modal {
     }
   }
   onClose() {
+    var _a;
+    (_a = this.composer) == null ? void 0 : _a.destroy();
+    this.finishModal();
     this.contentEl.empty();
   }
 };
-var ContentFormModal = class extends import_obsidian.Modal {
-  constructor(app, capabilities, initialCapabilityIds, initial, onSave) {
+var ContentFormModal = class extends GrowthModal {
+  constructor(app, capabilities, initialCapabilityIds, initial, onSave, contextCapabilityId, recentCapabilityIds = [], onRecentCapabilities, mode = (initial == null ? void 0 : initial.body) ? "edit" : "new") {
     super(app);
     this.capabilities = capabilities;
     this.initial = initial;
     this.onSave = onSave;
-    this.selectedCapabilities = new Set(initialCapabilityIds);
+    this.contextCapabilityId = contextCapabilityId;
+    this.recentCapabilityIds = recentCapabilityIds;
+    this.onRecentCapabilities = onRecentCapabilities;
+    this.mode = mode;
+    this.composer = null;
+    this.selectedCapabilities = new Set(initialRelatedCapabilityIds(initialCapabilityIds, contextCapabilityId));
   }
   onOpen() {
-    var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m;
-    this.modalEl.addClass("gm-modal", "gm-content-form-modal");
-    this.contentEl.createEl("h2", { text: ((_a = this.initial) == null ? void 0 : _a.body) ? "Organize content" : "Add to library" });
+    var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m, _n;
+    this.prepareModal("gm-content-form-modal");
+    const initialType = (_b = (_a = this.initial) == null ? void 0 : _a.type) != null ? _b : "knowledge";
+    const heading = this.contentEl.createEl("h2", { text: this.modalTitle(initialType) });
     const form = this.contentEl.createDiv("gm-form");
-    const type = this.selectField(form, "Type", ["knowledge", "case", "lesson", "hypothesis", "question"], (_c = (_b = this.initial) == null ? void 0 : _b.type) != null ? _c : "knowledge", (value) => CONTENT_LABELS[value]);
-    const title = this.inputField(form, "Title", "A clear, short title", (_e = (_d = this.initial) == null ? void 0 : _d.title) != null ? _e : "");
-    const body = this.textareaField(form, "Content", "What do you want to keep?", (_g = (_f = this.initial) == null ? void 0 : _f.body) != null ? _g : "");
-    const capabilitySection = form.createDiv("gm-form-field");
-    capabilitySection.createEl("label", { text: "Capabilities" });
-    const capabilityList = capabilitySection.createDiv("gm-capability-picker");
-    for (const capability of this.capabilities.filter((item) => item.status === "active").sort((a, b) => a.name.localeCompare(b.name))) {
-      const label = capabilityList.createEl("label", { cls: "gm-check-row" });
-      const checkbox = label.createEl("input", { attr: { type: "checkbox" } });
-      checkbox.checked = this.selectedCapabilities.has(capability.id);
-      checkbox.addEventListener("change", () => checkbox.checked ? this.selectedCapabilities.add(capability.id) : this.selectedCapabilities.delete(capability.id));
-      label.createSpan({ text: capabilityPath(capability.id, this.capabilities).map((item) => item.name).join(" / ") });
-    }
-    const status = this.selectField(form, "Status", CONTENT_STATUSES.filter((item) => item !== "archived"), (_i = (_h = this.initial) == null ? void 0 : _h.status) != null ? _i : "draft");
-    const confidence = this.selectField(form, "Confidence", CONFIDENCES, (_k = (_j = this.initial) == null ? void 0 : _j.confidence) != null ? _k : "low");
-    const source = this.selectField(form, "Source type", SOURCE_TYPES, (_m = (_l = this.initial) == null ? void 0 : _l.sourceType) != null ? _m : "personal-observation");
+    const title = this.inputField(form, "Title", "A clear, short title", (_d = (_c = this.initial) == null ? void 0 : _c.title) != null ? _d : "");
+    const contentField = form.createDiv("gm-form-field gm-content-field");
+    contentField.createEl("label", { text: "Content" });
+    const composerHost = contentField.createDiv("gm-composer");
+    this.composer = new ContentComposer(this.app, composerHost, (_f = (_e = this.initial) == null ? void 0 : _e.body) != null ? _f : "", (_h = (_g = this.initial) == null ? void 0 : _g.attachments) != null ? _h : []);
+    const related = form.createDiv("gm-related-section");
+    related.createEl("label", { text: "Related to" });
+    const relatedList = related.createDiv("gm-related-list");
+    const renderRelated = () => {
+      relatedList.empty();
+      if (!this.selectedCapabilities.size) relatedList.createSpan({ text: "None yet", cls: "gm-related-empty" });
+      for (const id of this.selectedCapabilities) {
+        const capability = this.capabilities.find((item) => item.id === id);
+        if (!capability) continue;
+        const chip = relatedList.createDiv("gm-related-chip");
+        chip.createSpan({ text: fullCapabilityPath(id, this.capabilities) });
+        const remove = chip.createEl("button", { attr: { "aria-label": `Remove ${capability.name}` } });
+        (0, import_obsidian.setIcon)(remove, "x");
+        remove.addEventListener("click", () => {
+          this.selectedCapabilities.delete(id);
+          renderRelated();
+        });
+      }
+      const add = relatedList.createEl("button", { text: "+ Add", cls: "gm-related-add" });
+      add.addEventListener("click", () => new CapabilityPickerModal(
+        this.app,
+        this.capabilities,
+        this.selectedCapabilities,
+        this.contextCapabilityId,
+        this.recentCapabilityIds,
+        (id) => {
+          var _a2;
+          this.selectedCapabilities.add(id);
+          const recent = updateRecentCapabilityIds(this.recentCapabilityIds, [id]);
+          void ((_a2 = this.onRecentCapabilities) == null ? void 0 : _a2.call(this, recent));
+          renderRelated();
+        }
+      ).open());
+    };
+    renderRelated();
+    const more = form.createEl("details", { cls: "gm-more-options" });
+    more.createEl("summary", { text: "More options" });
+    const options = more.createDiv("gm-more-options-grid");
+    const type = this.selectField(options, "Type", ["knowledge", "case", "lesson", "hypothesis", "question"], initialType, (value) => CONTENT_LABELS[value]);
+    const status = this.selectField(options, "Status", CONTENT_STATUSES.filter((item) => item !== "archived"), (_j = (_i = this.initial) == null ? void 0 : _i.status) != null ? _j : "draft");
+    const confidence = this.selectField(options, "Confidence", CONFIDENCES, (_l = (_k = this.initial) == null ? void 0 : _k.confidence) != null ? _l : "low");
+    const source = this.selectField(options, "Source type", SOURCE_TYPES, (_n = (_m = this.initial) == null ? void 0 : _m.sourceType) != null ? _n : "personal-observation");
     type.addEventListener("change", () => {
+      heading.setText(this.modalTitle(type.value));
       if (type.value === "hypothesis") {
         status.value = "validating";
         confidence.value = "low";
@@ -421,27 +834,30 @@ var ContentFormModal = class extends import_obsidian.Modal {
     const actions = this.contentEl.createDiv("gm-modal-actions");
     actions.createEl("button", { text: "Cancel" }).addEventListener("click", () => this.close());
     const save = actions.createEl("button", { text: "Save", cls: "mod-cta" });
-    save.addEventListener("click", () => void this.submit({
-      type: type.value,
-      title: title.value.trim(),
-      body: body.value.trim(),
-      capabilityIds: [...this.selectedCapabilities],
-      status: status.value,
-      confidence: confidence.value,
-      sourceType: source.value
-    }, save));
+    save.addEventListener("click", () => {
+      var _a2, _b2;
+      const content = (_b2 = (_a2 = this.composer) == null ? void 0 : _a2.value()) != null ? _b2 : { body: "", attachments: [], pendingAttachments: [] };
+      void this.submit({
+        type: type.value,
+        title: title.value.trim(),
+        body: content.body,
+        capabilityIds: [...this.selectedCapabilities],
+        status: status.value,
+        confidence: confidence.value,
+        sourceType: source.value,
+        attachments: content.attachments,
+        pendingAttachments: content.pendingAttachments
+      }, save);
+    });
+  }
+  modalTitle(type) {
+    if (this.mode === "organize") return "Organize Inbox";
+    return `${this.mode === "new" ? "New" : "Edit"} ${CONTENT_LABELS[type]}`;
   }
   inputField(container, labelText, placeholder, value) {
     const field = container.createDiv("gm-form-field");
     field.createEl("label", { text: labelText });
     const input = field.createEl("input", { cls: "gm-text-input", attr: { type: "text", placeholder } });
-    input.value = value;
-    return input;
-  }
-  textareaField(container, labelText, placeholder, value) {
-    const field = container.createDiv("gm-form-field");
-    field.createEl("label", { text: labelText });
-    const input = field.createEl("textarea", { cls: "gm-capture-input", attr: { placeholder, rows: "7" } });
     input.value = value;
     return input;
   }
@@ -456,9 +872,9 @@ var ContentFormModal = class extends import_obsidian.Modal {
     return select;
   }
   async submit(value, button) {
-    var _a;
-    if (!value.body && !value.title) {
-      new import_obsidian.Notice("Add a title or some content");
+    var _a, _b, _c;
+    if (!value.body && !value.title && !((_a = value.pendingAttachments) == null ? void 0 : _a.length) && !((_b = value.attachments) == null ? void 0 : _b.length)) {
+      new import_obsidian.Notice("Add a title, content, or attachment");
       return;
     }
     if (value.sourceType === "ai-generated") {
@@ -467,7 +883,7 @@ var ContentFormModal = class extends import_obsidian.Modal {
     }
     button.disabled = true;
     try {
-      await ((_a = this.onSave) == null ? void 0 : _a.call(this, value));
+      await ((_c = this.onSave) == null ? void 0 : _c.call(this, value));
       this.close();
       new import_obsidian.Notice("Saved to library");
     } catch (error) {
@@ -476,10 +892,13 @@ var ContentFormModal = class extends import_obsidian.Modal {
     }
   }
   onClose() {
+    var _a;
+    (_a = this.composer) == null ? void 0 : _a.destroy();
+    this.finishModal();
     this.contentEl.empty();
   }
 };
-var ReferenceProtectionModal = class extends import_obsidian.Modal {
+var ReferenceProtectionModal = class extends GrowthModal {
   constructor(app, capabilityName, referenceCount, onChoice) {
     super(app);
     this.capabilityName = capabilityName;
@@ -488,7 +907,7 @@ var ReferenceProtectionModal = class extends import_obsidian.Modal {
     this.settled = false;
   }
   onOpen() {
-    this.modalEl.addClass("gm-modal");
+    this.prepareModal();
     this.contentEl.createEl("h2", { text: `Archive ${this.capabilityName}?` });
     this.contentEl.createEl("p", {
       text: this.referenceCount > 0 ? `This branch is still referenced by ${this.referenceCount} content item${this.referenceCount === 1 ? "" : "s"}.` : "This capability will move to the archive. Its Markdown file will not be deleted."
@@ -507,18 +926,19 @@ var ReferenceProtectionModal = class extends import_obsidian.Modal {
     });
   }
   onClose() {
+    this.finishModal();
     this.contentEl.empty();
     if (!this.settled) this.onChoice(null);
   }
 };
-var CheckpointListModal = class extends import_obsidian.Modal {
+var CheckpointListModal = class extends GrowthModal {
   constructor(app, paths) {
     super(app);
     this.paths = paths;
   }
   onOpen() {
     var _a, _b;
-    this.modalEl.addClass("gm-modal");
+    this.prepareModal();
     this.contentEl.createEl("h2", { text: "Capability checkpoints" });
     if (this.paths.length === 0) this.contentEl.createEl("p", { text: "No checkpoints yet.", cls: "gm-muted" });
     const list = this.contentEl.createDiv("gm-checkpoint-list");
@@ -526,6 +946,7 @@ var CheckpointListModal = class extends import_obsidian.Modal {
     new import_obsidian.Setting(this.contentEl).addButton((button) => button.setButtonText("Done").setCta().onClick(() => this.close()));
   }
   onClose() {
+    this.finishModal();
     this.contentEl.empty();
   }
 };
@@ -1205,21 +1626,22 @@ var GrowthRepository = class {
     return null;
   }
   async createContent(input) {
-    var _a, _b, _c, _d, _e, _f, _g, _h;
+    var _a, _b, _c, _d, _e, _f, _g, _h, _i;
     await this.ensureFolder(CONTENT_FOLDERS[input.type]);
     const timestamp = nowIso();
     const title = (_b = (_a = input.title) == null ? void 0 : _a.trim()) != null ? _b : "";
     const savedAttachments = ((_c = input.attachmentFiles) == null ? void 0 : _c.length) ? await this.saveAttachmentFiles(input.attachmentFiles) : [];
-    const attachments = [...(_d = input.attachments) != null ? _d : [], ...savedAttachments];
+    const materialized = await this.materializePendingAttachments(input.body, (_d = input.pendingAttachments) != null ? _d : []);
+    const attachments = [...(_e = input.attachments) != null ? _e : [], ...savedAttachments, ...materialized.attachments];
     const item = {
       id: makeId(CONTENT_PREFIXES[input.type]),
       type: input.type,
       title,
-      body: input.type === "inbox" ? input.body.trim() : templateFor(input.type, input.body),
-      capabilityIds: [...new Set((_e = input.capabilityIds) != null ? _e : [])],
-      status: (_f = input.status) != null ? _f : input.type === "hypothesis" ? "validating" : "draft",
-      confidence: (_g = input.confidence) != null ? _g : "low",
-      sourceType: (_h = input.sourceType) != null ? _h : "personal-observation",
+      body: input.type === "inbox" ? materialized.body.trim() : templateFor(input.type, materialized.body),
+      capabilityIds: [...new Set((_f = input.capabilityIds) != null ? _f : [])],
+      status: (_g = input.status) != null ? _g : input.type === "hypothesis" ? "validating" : "draft",
+      confidence: (_h = input.confidence) != null ? _h : "low",
+      sourceType: (_i = input.sourceType) != null ? _i : "personal-observation",
       created: timestamp,
       updated: timestamp,
       attachments: attachments.length ? attachments : void 0
@@ -1234,7 +1656,13 @@ var GrowthRepository = class {
     });
     return { ...item, file };
   }
-  async updateContent(item) {
+  async updateContent(item, pendingAttachments = []) {
+    var _a;
+    if (pendingAttachments.length) {
+      const materialized = await this.materializePendingAttachments(item.body, pendingAttachments);
+      item.body = materialized.body;
+      item.attachments = [...(_a = item.attachments) != null ? _a : [], ...materialized.attachments];
+    }
     item.updated = nowIso();
     const targetPath = this.contentPath(item);
     if (item.file.path !== targetPath) {
@@ -1246,9 +1674,15 @@ var GrowthRepository = class {
     this.invalidate();
     return item;
   }
-  async convertInbox(item, type) {
+  async convertInbox(item, type, pendingAttachments = []) {
+    var _a;
     if (item.type !== "inbox") return item;
     const previousId = item.id;
+    if (pendingAttachments.length) {
+      const materialized = await this.materializePendingAttachments(item.body, pendingAttachments);
+      item.body = materialized.body;
+      item.attachments = [...(_a = item.attachments) != null ? _a : [], ...materialized.attachments];
+    }
     item.type = type;
     item.id = makeId(CONTENT_PREFIXES[type]);
     item.status = type === "hypothesis" ? "validating" : "draft";
@@ -1271,6 +1705,15 @@ var GrowthRepository = class {
     item.status = item.previousStatus && item.previousStatus !== "archived" ? item.previousStatus : "draft";
     item.previousStatus = void 0;
     await this.updateContent(item);
+  }
+  async materializePendingAttachments(body, pending) {
+    if (!pending.length) return { body, attachments: [] };
+    const attachments = await this.saveAttachmentFiles(pending.map((item) => item.file));
+    let materializedBody = body;
+    pending.forEach((item, index) => {
+      materializedBody = materializedBody.split(pendingAttachmentMarker(item.token)).join(attachmentEmbed(attachments[index].path));
+    });
+    return { body: materializedBody, attachments };
   }
   async saveAttachmentFiles(files) {
     var _a, _b;
@@ -1462,8 +1905,137 @@ function computeMobileBottomOffset(isMobile, viewportBottom, safeAreaInset, cand
   return Math.ceil(nativeHeight > 0 ? Math.max(nativeHeight, safeInset) + gap : safeInset);
 }
 
+// src/timeline.ts
+var DAY = 864e5;
+function startOfDay(date) {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+}
+function startOfMonth(year, month) {
+  return new Date(year, month, 1);
+}
+function addDays(date, days) {
+  const value = new Date(date);
+  value.setDate(value.getDate() + days);
+  return value;
+}
+function monthName(date) {
+  return date.toLocaleDateString("en", { month: "short" }).toUpperCase();
+}
+function dayRangeLabel(start, endExclusive) {
+  const end = addDays(endExclusive, -1);
+  if (start.getMonth() === end.getMonth()) return { label: monthName(start), detail: `${start.getDate()}\u2013${end.getDate()}` };
+  return { label: `${monthName(start)}\u2013${monthName(end)}`, detail: `${start.getDate()}\u2013${end.getDate()}` };
+}
+function timelineRangeStart(range, now = /* @__PURE__ */ new Date()) {
+  const tomorrow = addDays(startOfDay(now), 1);
+  if (range === "all") return null;
+  if (range === "30d") return addDays(tomorrow, -30);
+  if (range === "3m") return startOfMonth(now.getFullYear(), now.getMonth() - 2);
+  if (range === "6m") return startOfMonth(now.getFullYear(), now.getMonth() - 5);
+  return startOfMonth(now.getFullYear(), now.getMonth() - 11);
+}
+function naturalTimelineBuckets(range, now = /* @__PURE__ */ new Date(), earliest) {
+  const tomorrow = addDays(startOfDay(now), 1);
+  if (range === "30d") {
+    const start = addDays(tomorrow, -30);
+    return Array.from({ length: 6 }, (_, index) => {
+      const bucketStart = addDays(start, index * 5);
+      const bucketEnd = addDays(bucketStart, 5);
+      return { start: bucketStart.getTime(), end: bucketEnd.getTime(), ...dayRangeLabel(bucketStart, bucketEnd) };
+    });
+  }
+  if (range === "3m") {
+    const first = startOfMonth(now.getFullYear(), now.getMonth() - 2);
+    const buckets = [];
+    for (let month = 0; month < 3; month += 1) {
+      const monthStart = startOfMonth(first.getFullYear(), first.getMonth() + month);
+      const secondHalf = new Date(monthStart.getFullYear(), monthStart.getMonth(), 16);
+      const monthEnd = startOfMonth(monthStart.getFullYear(), monthStart.getMonth() + 1);
+      const isCurrent = monthStart.getFullYear() === now.getFullYear() && monthStart.getMonth() === now.getMonth();
+      const currentFirstHalf = isCurrent && now.getDate() < 16;
+      buckets.push({
+        start: monthStart.getTime(),
+        end: (currentFirstHalf ? tomorrow : secondHalf).getTime(),
+        label: monthName(monthStart),
+        detail: currentFirstHalf ? "1\u2013NOW" : "1\u201315"
+      });
+      buckets.push({
+        start: secondHalf.getTime(),
+        end: (isCurrent && !currentFirstHalf ? tomorrow : monthEnd).getTime(),
+        label: monthName(monthStart),
+        detail: isCurrent && !currentFirstHalf ? "16\u2013NOW" : `16\u2013${addDays(monthEnd, -1).getDate()}`
+      });
+    }
+    return buckets;
+  }
+  if (range === "6m") {
+    const first = startOfMonth(now.getFullYear(), now.getMonth() - 5);
+    return Array.from({ length: 6 }, (_, index) => {
+      const bucketStart = startOfMonth(first.getFullYear(), first.getMonth() + index);
+      const next = startOfMonth(bucketStart.getFullYear(), bucketStart.getMonth() + 1);
+      const isCurrent = bucketStart.getFullYear() === now.getFullYear() && bucketStart.getMonth() === now.getMonth();
+      return { start: bucketStart.getTime(), end: (isCurrent ? tomorrow : next).getTime(), label: monthName(bucketStart) };
+    });
+  }
+  if (range === "1y") {
+    const first = startOfMonth(now.getFullYear(), now.getMonth() - 11);
+    return Array.from({ length: 6 }, (_, index) => {
+      const bucketStart = startOfMonth(first.getFullYear(), first.getMonth() + index * 2);
+      const next = startOfMonth(bucketStart.getFullYear(), bucketStart.getMonth() + 2);
+      const end = next > tomorrow ? tomorrow : next;
+      const lastMonth = startOfMonth(end.getFullYear(), end.getMonth() - (end.getDate() === 1 ? 1 : 0));
+      return { start: bucketStart.getTime(), end: end.getTime(), label: `${monthName(bucketStart)}\u2013${monthName(lastMonth)}` };
+    });
+  }
+  return allBuckets(earliest != null ? earliest : now, now, tomorrow);
+}
+function allBuckets(earliest, now, tomorrow) {
+  const first = startOfDay(earliest);
+  const spanYears = Math.max(0, (now.getTime() - first.getTime()) / (365.2425 * DAY));
+  const buckets = [];
+  if (spanYears <= 2) {
+    let cursor = new Date(first.getFullYear(), Math.floor(first.getMonth() / 3) * 3, 1);
+    while (cursor <= now) {
+      const next = startOfMonth(cursor.getFullYear(), cursor.getMonth() + 3);
+      buckets.push({ start: cursor.getTime(), end: (next > tomorrow ? tomorrow : next).getTime(), label: `Q${Math.floor(cursor.getMonth() / 3) + 1}`, detail: String(cursor.getFullYear()) });
+      cursor = next;
+    }
+    return buckets;
+  }
+  if (spanYears <= 5) {
+    let cursor = new Date(first.getFullYear(), first.getMonth() < 6 ? 0 : 6, 1);
+    while (cursor <= now) {
+      const next = startOfMonth(cursor.getFullYear(), cursor.getMonth() + 6);
+      buckets.push({ start: cursor.getTime(), end: (next > tomorrow ? tomorrow : next).getTime(), label: cursor.getMonth() === 0 ? "JAN\u2013JUN" : "JUL\u2013DEC", detail: String(cursor.getFullYear()) });
+      cursor = next;
+    }
+    return buckets;
+  }
+  const firstYear = first.getFullYear();
+  const yearCount = now.getFullYear() - firstYear + 1;
+  const step = Math.max(1, Math.ceil(yearCount / 12));
+  for (let year = firstYear; year <= now.getFullYear(); year += step) {
+    const start = new Date(year, 0, 1);
+    const next = new Date(year + step, 0, 1);
+    const endYear = Math.min(year + step - 1, now.getFullYear());
+    buckets.push({ start: start.getTime(), end: (next > tomorrow ? tomorrow : next).getTime(), label: step === 1 ? String(year) : `${year}\u2013${endYear}` });
+  }
+  return buckets;
+}
+function timelineBucketIndex(timestamp, buckets) {
+  const time = timestamp instanceof Date ? timestamp.getTime() : typeof timestamp === "number" ? timestamp : new Date(timestamp).getTime();
+  return buckets.findIndex((bucket) => time >= bucket.start && time < bucket.end);
+}
+
 // src/view.ts
 var VIEW_TYPE_GROWTH_MAP = "growth-map-view";
+var CONTENT_PLURAL_LABELS = {
+  knowledge: "Knowledge",
+  case: "Cases",
+  lesson: "Lessons",
+  hypothesis: "Hypotheses",
+  question: "Questions"
+};
 var GrowthMapView = class extends import_obsidian4.ItemView {
   constructor(leaf, plugin) {
     super(leaf);
@@ -1710,17 +2282,6 @@ var GrowthMapView = class extends import_obsidian4.ItemView {
     (0, import_obsidian4.setIcon)(addIcon, "plus");
     addArea.createSpan({ text: "Add area" });
     addArea.addEventListener("click", () => void this.addCapability(null));
-    const recordedContentIds = new Set(monthEvents.filter((event) => event.eventType === "content-created" && event.contentId).map((event) => event.contentId));
-    const legacyNewItems = contents.filter((item) => item.created >= monthStart.toISOString() && !recordedContentIds.has(item.id)).length;
-    const newItems = recordedContentIds.size + legacyNewItems;
-    const stageChanges = monthEvents.filter((event) => event.eventType === "capability-stage-changed").length;
-    const month = container.createEl("button", { cls: "gm-month-card" });
-    const monthText = month.createDiv();
-    monthText.createEl("strong", { text: "This Month" });
-    monthText.createSpan({ text: `${newItems} new item${newItems === 1 ? "" : "s"} \xB7 ${stageChanges} stage change${stageChanges === 1 ? "" : "s"}` });
-    const monthArrow = month.createSpan();
-    (0, import_obsidian4.setIcon)(monthArrow, "chevron-right");
-    month.addEventListener("click", () => void this.navigate("timeline"));
     const focus = active.filter((item) => item.focus).slice(0, 5);
     this.sectionTitle(container, "Focus", focus.length ? void 0 : "Choose up to five capabilities");
     if (focus.length === 0) {
@@ -1737,6 +2298,17 @@ var GrowthMapView = class extends import_obsidian4.ItemView {
         row.addEventListener("click", () => void this.navigate("capability", capability.id));
       }
     }
+    const recordedContentIds = new Set(monthEvents.filter((event) => event.eventType === "content-created" && event.contentId).map((event) => event.contentId));
+    const legacyNewItems = contents.filter((item) => item.created >= monthStart.toISOString() && !recordedContentIds.has(item.id)).length;
+    const newItems = recordedContentIds.size + legacyNewItems;
+    const stageChanges = monthEvents.filter((event) => event.eventType === "capability-stage-changed").length;
+    const month = container.createEl("button", { cls: "gm-month-card" });
+    const monthText = month.createDiv();
+    monthText.createEl("strong", { text: "This Month" });
+    monthText.createSpan({ text: `${newItems} new item${newItems === 1 ? "" : "s"} \xB7 ${stageChanges} stage change${stageChanges === 1 ? "" : "s"}` });
+    const monthArrow = month.createSpan();
+    (0, import_obsidian4.setIcon)(monthArrow, "chevron-right");
+    month.addEventListener("click", () => void this.navigate("timeline"));
     const activeContents = contents.filter((item) => item.status !== "archived");
     const validationCount = activeContents.filter((item) => item.type === "hypothesis" && item.status === "validating").length;
     const questionCount = activeContents.filter((item) => item.type === "question").length;
@@ -1856,19 +2428,6 @@ var GrowthMapView = class extends import_obsidian4.ItemView {
     const relevantIds = descendantsOf(capability.id, capabilities);
     relevantIds.add(capability.id);
     const related = contents.filter((item) => item.capabilityIds.some((id) => relevantIds.has(id)));
-    this.sectionTitle(container, "Library");
-    const stats = container.createDiv("gm-stat-grid");
-    for (const type of ["knowledge", "case", "lesson", "hypothesis", "question"]) {
-      const count = related.filter((item) => item.type === type).length;
-      const stat = stats.createEl("button", { cls: "gm-stat-card" });
-      stat.createEl("strong", { text: String(count) });
-      stat.createSpan({ text: CONTENT_LABELS[type] });
-      stat.addEventListener("click", () => {
-        this.libraryType = type;
-        this.libraryCapability = capability.id;
-        void this.navigate("library");
-      });
-    }
     const recentEvents = (await this.plugin.repository.loadGrowthEvents(timeRangeStart("3m"))).filter(
       (event) => event.capabilityIds.some((id) => relevantIds.has(id))
     ).slice(0, 3);
@@ -1881,7 +2440,7 @@ var GrowthMapView = class extends import_obsidian4.ItemView {
       (item) => (item.strength > 0 || item.pinned) && (item.fromId === capability.id || item.toId === capability.id)
     ).slice(0, 5);
     if (connections.length) {
-      this.sectionTitle(container, "Connected Capabilities");
+      this.sectionTitle(container, "Connected");
       const connectionList = container.createDiv("gm-connected-list");
       for (const connection of connections) {
         const otherId = connection.fromId === capability.id ? connection.toId : connection.fromId;
@@ -1896,18 +2455,25 @@ var GrowthMapView = class extends import_obsidian4.ItemView {
         row.addEventListener("click", () => void this.navigate("connection", connectionKey(connection.fromId, connection.toId)));
       }
     }
-    this.sectionTitle(container, "Recent Content");
-    const recent = related.sort((a, b) => b.updated.localeCompare(a.updated)).slice(0, 4);
-    if (recent.length) this.renderContentCards(container, recent, capabilities);
-    else this.emptyState(container, "Capture something here and it will be linked automatically.");
-    const add = container.createEl("button", { text: "+  Add", cls: "gm-inline-add" });
-    add.addEventListener("click", () => this.openContentForm([capability.id]));
+    this.sectionTitle(container, "Library");
+    const summary = container.createDiv("gm-library-summary");
+    for (const type of ["knowledge", "case", "lesson", "hypothesis", "question"]) {
+      const count = related.filter((item) => item.type === type).length;
+      const stat = summary.createEl("button", { text: `${count} ${count === 1 ? CONTENT_LABELS[type] : CONTENT_PLURAL_LABELS[type]}` });
+      stat.addEventListener("click", () => {
+        this.libraryType = type;
+        this.libraryCapability = capability.id;
+        void this.navigate("library");
+      });
+    }
+    const add = container.createEl("button", { text: "+ Add content", cls: "gm-inline-add" });
+    add.addEventListener("click", () => this.openContentForm([capability.id], void 0, void 0, capability.id));
   }
   async renderTimeline(container) {
     var _a, _b, _c, _d;
     const capabilities = (await this.plugin.repository.loadCapabilities()).filter((item) => item.status === "active");
     const contents = (await this.plugin.repository.loadContentMetadata()).filter((item) => item.status !== "archived");
-    const start = timeRangeStart(this.timeRange);
+    const start = timelineRangeStart(this.timeRange);
     const events = await this.plugin.repository.loadGrowthEvents(start);
     const recordedContentIds = new Set(events.filter((event) => event.eventType === "content-created" && event.contentId).map((event) => event.contentId));
     const activities = events.map((event) => ({ ...event, recorded: true }));
@@ -1933,7 +2499,7 @@ var GrowthMapView = class extends import_obsidian4.ItemView {
         void this.render();
       });
     }
-    const last30Start = timeRangeStart("30d");
+    const last30Start = timelineRangeStart("30d");
     const last30Events = this.timeRange === "30d" ? events : await this.plugin.repository.loadGrowthEvents(last30Start);
     const last30Recorded = new Set(last30Events.filter((event) => event.eventType === "content-created" && event.contentId).map((event) => event.contentId));
     const last30Items = last30Recorded.size + contents.filter((item) => item.created >= last30Start.toISOString() && !last30Recorded.has(item.id)).length;
@@ -1954,14 +2520,25 @@ var GrowthMapView = class extends import_obsidian4.ItemView {
     const roots = capabilities.filter((item) => item.parentId === null).sort((left, right) => left.order - right.order);
     const focus = capabilities.filter((item) => item.focus && item.parentId !== null);
     const rows = [...roots, ...focus].filter((item, index, all) => all.findIndex((candidate) => candidate.id === item.id) === index);
-    const buckets = this.timelineBuckets(start, activities);
+    const earliest = activities.length ? new Date(activities[activities.length - 1].timestamp) : null;
+    const buckets = naturalTimelineBuckets(this.timeRange, /* @__PURE__ */ new Date(), earliest);
+    const activitiesByBucket = buckets.map(() => []);
+    for (const activity of activities) {
+      const index = timelineBucketIndex(activity.timestamp, buckets);
+      if (index >= 0) activitiesByBucket[index].push(activity);
+    }
     this.sectionTitle(container, "Time Map", "activity \xB7 stage change");
     if (!activities.length) this.emptyState(container, "Changes recorded from v1.1.0 will appear here.");
     else {
       const map = container.createDiv("gm-time-map");
+      map.style.setProperty("--gm-time-columns", String(buckets.length));
       const header = map.createDiv("gm-time-map-header");
       header.createSpan();
-      for (const bucket of buckets) header.createSpan({ text: bucket.label });
+      for (const bucket of buckets) {
+        const bucketLabel = header.createDiv("gm-time-bucket-label");
+        bucketLabel.createEl("strong", { text: bucket.label });
+        if (bucket.detail) bucketLabel.createSpan({ text: bucket.detail });
+      }
       for (const rowCapability of rows) {
         const row = map.createDiv("gm-time-map-row");
         this.applySpectrum(row, rowCapability.id, capabilities);
@@ -1969,9 +2546,9 @@ var GrowthMapView = class extends import_obsidian4.ItemView {
         label.addEventListener("click", () => void this.navigate("capability", rowCapability.id));
         const relatedIds = descendantsOf(rowCapability.id, capabilities);
         relatedIds.add(rowCapability.id);
-        for (const bucket of buckets) {
+        for (const [bucketIndex] of buckets.entries()) {
           const cell = row.createDiv("gm-time-cell");
-          const matches = activities.filter((activity) => activity.capabilityIds.some((id) => relatedIds.has(id)) && new Date(activity.timestamp).getTime() >= bucket.start && new Date(activity.timestamp).getTime() < bucket.end);
+          const matches = activitiesByBucket[bucketIndex].filter((activity) => activity.capabilityIds.some((id) => relatedIds.has(id)));
           if (matches.length) {
             const hasStage = matches.some((activity) => activity.eventType === "capability-stage-changed");
             const allRecorded = matches.every((activity) => activity.recorded);
@@ -1980,7 +2557,7 @@ var GrowthMapView = class extends import_obsidian4.ItemView {
               attr: { "aria-label": matches.length === 1 ? this.activityLabel(matches[0], contents) : `${matches.length} growth activities` }
             });
             marker.addEventListener("click", () => void (matches.length === 1 ? this.showTimelineActivity(matches[0], capabilities, contents) : this.showTimelineBucket(matches, capabilities, contents)));
-            if (matches.length > 1) marker.createSpan({ text: `+${matches.length - 1}`, cls: "gm-time-more" });
+            if (matches.length > 1) marker.createSpan({ text: String(matches.length), cls: "gm-time-more" });
           }
         }
       }
@@ -1994,7 +2571,10 @@ var GrowthMapView = class extends import_obsidian4.ItemView {
     const list = container.createDiv("gm-growth-list");
     let lastDay = "";
     for (const activity of activities.slice(0, 24)) {
-      const day = new Date(activity.timestamp).toLocaleDateString(void 0, { month: "short", day: "numeric" }).toUpperCase();
+      const eventDate = new Date(activity.timestamp);
+      const today = /* @__PURE__ */ new Date();
+      const yesterday = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 1);
+      const day = eventDate.toDateString() === today.toDateString() ? "TODAY" : eventDate.toDateString() === yesterday.toDateString() ? "YESTERDAY" : eventDate.toLocaleDateString(void 0, { month: "short", day: "numeric" }).toUpperCase();
       if (day !== lastDay) {
         list.createEl("h3", { text: day });
         lastDay = day;
@@ -2167,7 +2747,6 @@ ${item.body}`.toLocaleLowerCase().includes(needle));
     else this.emptyState(container, "No content matches these filters.");
   }
   async renderContent(container) {
-    var _a;
     const capabilities = await this.plugin.repository.loadCapabilities();
     const item = this.selectedContentId ? await this.plugin.repository.loadContent(this.selectedContentId) : null;
     if (!item) {
@@ -2184,18 +2763,19 @@ ${item.body}`.toLocaleLowerCase().includes(needle));
     badges.createSpan({ text: item.status });
     badges.createSpan({ text: `${item.confidence} confidence` });
     badges.createSpan({ text: item.sourceType });
+    const preview = container.createDiv("gm-markdown-preview");
+    await this.renderContentBody(preview, item);
     if (item.capabilityIds.length) {
-      const links = container.createDiv("gm-content-capabilities");
+      const related = container.createDiv("gm-content-related");
+      related.createEl("h2", { text: "Related to" });
+      const links = related.createDiv("gm-content-capabilities");
       for (const id of item.capabilityIds) {
         const capability = capabilities.find((entry) => entry.id === id);
         if (!capability) continue;
-        const button = links.createEl("button", { text: capability.name });
+        const button = links.createEl("button", { text: capabilityPath(capability.id, capabilities).map((entry) => entry.name).join(" / ") });
         button.addEventListener("click", () => void this.navigate("capability", capability.id));
       }
     }
-    const preview = container.createDiv("gm-markdown-preview markdown-rendered");
-    await import_obsidian4.MarkdownRenderer.render(this.app, item.body, preview, item.file.path, this);
-    await this.renderAttachments(container, (_a = item.attachments) != null ? _a : []);
     const meta = container.createDiv("gm-content-meta");
     meta.createSpan({ text: item.id });
     meta.createSpan({ text: `Updated ${relativeTime(item.updated)}` });
@@ -2275,17 +2855,29 @@ ${item.body}`.toLocaleLowerCase().includes(needle));
     var _a;
     const capabilities = await this.plugin.repository.loadCapabilities();
     const capability = capabilities.find((item) => item.id === capabilityId);
-    new QuickCaptureModal(this.app, (_a = capability == null ? void 0 : capability.name) != null ? _a : null, async (title, content, files) => {
-      await this.plugin.repository.createContent({ type: "inbox", title, body: content, capabilityIds: capability ? [capability.id] : [], attachmentFiles: files });
+    new QuickCaptureModal(this.app, (_a = capability == null ? void 0 : capability.name) != null ? _a : null, async (title, content, pendingAttachments) => {
+      await this.plugin.repository.createContent({ type: "inbox", title, body: content, capabilityIds: capability ? [capability.id] : [], pendingAttachments });
+      if (capability) await this.rememberCapabilities([capability.id]);
       this.requestRefresh();
     }).open();
   }
-  openContentForm(capabilityIds, initial, onSave) {
+  openContentForm(capabilityIds, initial, onSave, contextCapabilityId) {
     void this.plugin.repository.loadCapabilities().then((capabilities) => {
-      new ContentFormModal(this.app, capabilities, capabilityIds, initial, onSave != null ? onSave : (async (value) => {
-        await this.plugin.repository.createContent(value);
-        this.requestRefresh();
-      })).open();
+      new ContentFormModal(
+        this.app,
+        capabilities,
+        capabilityIds,
+        initial,
+        onSave != null ? onSave : (async (value) => {
+          await this.plugin.repository.createContent(value);
+          await this.rememberCapabilities(value.capabilityIds);
+          this.requestRefresh();
+        }),
+        contextCapabilityId,
+        this.plugin.settings.recentCapabilityIds,
+        (ids) => this.saveRecentCapabilities(ids),
+        (initial == null ? void 0 : initial.body) ? "edit" : "new"
+      ).open();
     });
   }
   organizeInbox(item, capabilities) {
@@ -2295,19 +2887,22 @@ ${item.body}`.toLocaleLowerCase().includes(needle));
       status: "draft",
       confidence: item.confidence,
       sourceType: item.sourceType,
-      type: "knowledge"
+      type: "knowledge",
+      attachments: item.attachments
     }, async (value) => {
       item.body = value.body;
-      const converted = await this.plugin.repository.convertInbox(item, value.type);
+      item.attachments = value.attachments;
+      const converted = await this.plugin.repository.convertInbox(item, value.type, value.pendingAttachments);
       converted.title = value.title;
       converted.capabilityIds = value.capabilityIds;
       converted.status = value.status;
       converted.confidence = value.confidence;
       converted.sourceType = value.sourceType;
       await this.plugin.repository.updateContent(converted);
+      await this.rememberCapabilities(value.capabilityIds);
       this.selectedContentId = converted.id;
       await this.render();
-    }).open();
+    }, void 0, this.plugin.settings.recentCapabilityIds, (ids) => this.saveRecentCapabilities(ids), "organize").open();
   }
   async contentActions(item, capabilities) {
     const choice = await chooseOption(this.app, this.contentTitle(item), [
@@ -2330,10 +2925,19 @@ ${item.body}`.toLocaleLowerCase().includes(needle));
         item.status = value.status;
         item.confidence = value.confidence;
         item.sourceType = value.sourceType;
-        await this.plugin.repository.updateContent(item);
+        item.attachments = value.attachments;
+        await this.plugin.repository.updateContent(item, value.pendingAttachments);
+        await this.rememberCapabilities(value.capabilityIds);
         await this.render();
-      }).open();
+      }, void 0, this.plugin.settings.recentCapabilityIds, (ids) => this.saveRecentCapabilities(ids), "edit").open();
     }
+  }
+  async rememberCapabilities(ids) {
+    await this.saveRecentCapabilities(updateRecentCapabilityIds(this.plugin.settings.recentCapabilityIds, ids));
+  }
+  async saveRecentCapabilities(ids) {
+    this.plugin.settings.recentCapabilityIds = ids;
+    await this.plugin.saveSettings();
   }
   async addCapability(parentId) {
     const name = await promptText(this.app, parentId ? "Add child capability" : "Add growth area", "Capability name");
@@ -2554,25 +3158,6 @@ ${item.body}`.toLocaleLowerCase().includes(needle));
     item.createEl("strong", { text: value });
     item.createSpan({ text: label });
   }
-  timelineBuckets(start, activities) {
-    var _a;
-    const now = Date.now();
-    const activityTimes = activities.map((item) => new Date(item.timestamp).getTime()).filter(Number.isFinite);
-    const startTime = (_a = start == null ? void 0 : start.getTime()) != null ? _a : activityTimes.length ? Math.min(...activityTimes) : now - 90 * 864e5;
-    const safeStart = Math.min(startTime, now - 864e5);
-    const bucketCount = 6;
-    const step = Math.max(1, (now + 1 - safeStart) / bucketCount);
-    const shortRange = now - safeStart <= 62 * 864e5;
-    return Array.from({ length: bucketCount }, (_, index) => {
-      const bucketStart = safeStart + step * index;
-      const bucketEnd = index === bucketCount - 1 ? now + 1 : safeStart + step * (index + 1);
-      return {
-        start: bucketStart,
-        end: bucketEnd,
-        label: new Date(bucketStart).toLocaleDateString(void 0, shortRange ? { month: "short", day: "numeric" } : { month: "short" })
-      };
-    });
-  }
   activityLabel(activity, contents) {
     var _a, _b, _c, _d, _e, _f;
     const content = activity.contentId ? contents.find((item) => item.id === activity.contentId) : void 0;
@@ -2615,46 +3200,50 @@ ${item.body}`.toLocaleLowerCase().includes(needle));
     const path = activity.capabilityIds.map((id) => capabilityPath(id, capabilities).map((item) => item.name).join(" / ")).filter(Boolean).join(" \xB7 ");
     text.createEl("strong", { text: path || "Unlinked content" });
     text.createSpan({ text: this.activityLabel(activity, contents) });
-    row.createSpan({ text: new Date(activity.timestamp).toLocaleDateString(void 0, { month: "short", day: "numeric" }), cls: "gm-muted" });
+    const eventDate = new Date(activity.timestamp);
+    const today = /* @__PURE__ */ new Date();
+    const sameDay = eventDate.toDateString() === today.toDateString();
+    row.createSpan({
+      text: `${sameDay ? "" : `${eventDate.toLocaleDateString(void 0, { month: "short", day: "numeric" })} \xB7 `}${eventDate.toLocaleTimeString(void 0, { hour: "2-digit", minute: "2-digit" })}`,
+      cls: "gm-muted gm-growth-time"
+    });
     marker.setAttribute("aria-hidden", "true");
     row.addEventListener("click", () => void this.showTimelineActivity(activity, capabilities, contents));
   }
-  async renderAttachments(container, attachments) {
-    if (!attachments.length) return;
-    this.sectionTitle(container, "Attachments", `${attachments.length}`);
-    const list = container.createDiv("gm-attachment-list");
-    const extra = attachments.length > 3 ? list.createDiv("gm-attachment-extra") : null;
-    attachments.forEach((attachment, index) => {
-      var _a, _b, _c;
-      const parent = index < 3 || !extra ? list : extra;
-      const file = this.app.vault.getAbstractFileByPath(attachment.path);
-      const extension = (_b = (_a = attachment.path.split(".").pop()) == null ? void 0 : _a.toLocaleLowerCase()) != null ? _b : "";
-      const isImage = ((_c = attachment.mimeType) == null ? void 0 : _c.startsWith("image/")) || ["jpg", "jpeg", "png", "webp", "gif"].includes(extension);
-      if (isImage && file instanceof import_obsidian4.TFile) {
-        const figure = parent.createEl("figure", { cls: "gm-attachment-image" });
-        const image = figure.createEl("img", { attr: { src: this.app.vault.getResourcePath(file), alt: attachment.name, loading: "lazy" } });
-        image.addEventListener("click", () => void this.openAttachment(file));
-        figure.createEl("figcaption", { text: attachment.name });
-        return;
+  async renderContentBody(container, item) {
+    var _a;
+    const blocks = parseContentBlocks(item.body, (_a = item.attachments) != null ? _a : []);
+    for (const block of blocks) {
+      if (block.kind === "text") {
+        if (!block.value.trim()) continue;
+        const segment = container.createDiv("gm-markdown-segment markdown-rendered");
+        await import_obsidian4.MarkdownRenderer.render(this.app, block.value, segment, item.file.path, this);
+        continue;
       }
-      const card = parent.createEl("button", { cls: "gm-attachment-card" });
-      const icon = card.createSpan();
-      (0, import_obsidian4.setIcon)(icon, extension === "pdf" ? "file-text" : extension === "doc" || extension === "docx" ? "file-type-2" : "file");
-      const text = card.createDiv();
-      text.createEl("strong", { text: attachment.name });
-      text.createSpan({ text: file instanceof import_obsidian4.TFile ? this.formatBytes(file.stat.size) : attachment.path });
-      card.createSpan({ text: "Open", cls: "gm-attachment-open" });
-      if (file instanceof import_obsidian4.TFile) card.addEventListener("click", () => void this.openAttachment(file));
-      else card.disabled = true;
-    });
-    if (extra) {
-      extra.hidden = true;
-      const show = container.createEl("button", { text: "Show All Attachments", cls: "gm-text-button gm-show-attachments" });
-      show.addEventListener("click", () => {
-        extra.hidden = !extra.hidden;
-        show.setText(extra.hidden ? "Show All Attachments" : "Show Fewer Attachments");
-      });
+      if (block.attachment) this.renderInlineAttachment(container, block.attachment);
     }
+  }
+  renderInlineAttachment(container, attachment) {
+    var _a, _b, _c;
+    const file = this.app.vault.getAbstractFileByPath(attachment.path);
+    const extension = (_b = (_a = attachment.path.split(".").pop()) == null ? void 0 : _a.toLocaleLowerCase()) != null ? _b : "";
+    const isImage = ((_c = attachment.mimeType) == null ? void 0 : _c.startsWith("image/")) || ["jpg", "jpeg", "png", "webp", "gif"].includes(extension);
+    if (isImage && file instanceof import_obsidian4.TFile) {
+      const figure = container.createEl("figure", { cls: "gm-attachment-image gm-inline-attachment" });
+      const image = figure.createEl("img", { attr: { src: this.app.vault.getResourcePath(file), alt: attachment.name, loading: "lazy" } });
+      image.addEventListener("click", () => void this.openAttachment(file));
+      figure.createEl("figcaption", { text: attachment.name });
+      return;
+    }
+    const card = container.createEl("button", { cls: "gm-attachment-card gm-inline-attachment" });
+    const icon = card.createSpan();
+    (0, import_obsidian4.setIcon)(icon, extension === "pdf" ? "file-text" : extension === "doc" || extension === "docx" ? "file-type-2" : "file");
+    const text = card.createDiv();
+    text.createEl("strong", { text: attachment.name });
+    text.createSpan({ text: `${extension.toUpperCase() || "FILE"}${file instanceof import_obsidian4.TFile ? ` \xB7 ${this.formatBytes(file.stat.size)}` : ""}` });
+    card.createSpan({ text: "Open", cls: "gm-attachment-open" });
+    if (file instanceof import_obsidian4.TFile) card.addEventListener("click", () => void this.openAttachment(file));
+    else card.disabled = true;
   }
   async openAttachment(file) {
     try {
@@ -2803,8 +3392,8 @@ var GrowthMapPlugin = class extends import_obsidian5.Plugin {
       activeView.openQuickCapture();
       return;
     }
-    new QuickCaptureModal(this.app, null, async (title, content, files) => {
-      await this.repository.createContent({ type: "inbox", title, body: content, attachmentFiles: files });
+    new QuickCaptureModal(this.app, null, async (title, content, pendingAttachments) => {
+      await this.repository.createContent({ type: "inbox", title, body: content, pendingAttachments });
     }).open();
   }
   async newCapability() {
