@@ -20,6 +20,7 @@ export default class GrowthMapPlugin extends Plugin {
     this.addCommand({ id: "quick-capture", name: "Quick Capture", callback: () => void this.quickCapture() });
     this.addCommand({ id: "new-capability", name: "New Capability", callback: () => void this.newCapability() });
     this.addCommand({ id: "search", name: "Search", callback: () => void this.openSearch() });
+    this.addCommand({ id: "open-timeline", name: "Open Timeline", callback: () => void this.activateView("timeline") });
     this.addCommand({ id: "open-archive", name: "Open Archive", callback: () => void this.activateView("archive") });
     this.addCommand({ id: "create-checkpoint", name: "Create Checkpoint", callback: () => void this.createCheckpoint() });
     this.addCommand({ id: "restore-last-checkpoint", name: "Restore Last Checkpoint", callback: () => void this.restoreLastCheckpoint() });
@@ -77,8 +78,8 @@ export default class GrowthMapPlugin extends Plugin {
       activeView.openQuickCapture();
       return;
     }
-    new QuickCaptureModal(this.app, null, async (title, content) => {
-      await this.repository.createContent({ type: "inbox", title, body: content });
+    new QuickCaptureModal(this.app, null, async (title, content, files) => {
+      await this.repository.createContent({ type: "inbox", title, body: content, attachmentFiles: files });
     }).open();
   }
 

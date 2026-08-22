@@ -104,10 +104,12 @@ class ChoiceModal<T> extends Modal {
 }
 
 export class QuickCaptureModal extends Modal {
+  private selectedFiles: File[] = [];
+
   constructor(
     app: App,
     private readonly contextName: string | null,
-    private readonly onSave: (title: string, content: string) => Promise<void>
+    private readonly onSave: (title: string, content: string, files: File[]) => Promise<void>
   ) {
     super(app);
   }
@@ -123,6 +125,24 @@ export class QuickCaptureModal extends Modal {
     const details = this.contentEl.createEl("details", { cls: "gm-optional-title" });
     details.createEl("summary", { text: "Add a title (optional)" });
     const title = details.createEl("input", { cls: "gm-text-input", attr: { type: "text", placeholder: "Title" } });
+    const attachmentInput = this.contentEl.createEl("input", {
+      cls: "gm-file-input",
+      attr: {
+        type: "file",
+        accept: ".jpg,.jpeg,.png,.webp,.gif,.pdf,.doc,.docx,.txt,.md,image/jpeg,image/png,image/webp,image/gif,application/pdf,text/plain,text/markdown"
+      }
+    });
+    attachmentInput.multiple = true;
+    const attachmentRow = this.contentEl.createDiv("gm-capture-attachment-row");
+    const addAttachment = attachmentRow.createEl("button", { text: "Add Attachment", cls: "gm-attachment-picker" });
+    const attachmentSummary = attachmentRow.createSpan({ text: "Optional", cls: "gm-muted" });
+    addAttachment.addEventListener("click", () => attachmentInput.click());
+    attachmentInput.addEventListener("change", () => {
+      this.selectedFiles = Array.from(attachmentInput.files ?? []);
+      attachmentSummary.setText(this.selectedFiles.length
+        ? `${this.selectedFiles.length} selected`
+        : "Optional");
+    });
     const actions = this.contentEl.createDiv("gm-modal-actions");
     actions.createEl("button", { text: "Cancel" }).addEventListener("click", () => this.close());
     const save = actions.createEl("button", { text: "Save to Inbox", cls: "mod-cta" });
@@ -140,7 +160,7 @@ export class QuickCaptureModal extends Modal {
     }
     button.disabled = true;
     try {
-      await this.onSave(title.trim(), content.trim());
+      await this.onSave(title.trim(), content.trim(), this.selectedFiles);
       this.close();
       new Notice("Saved to Growth Map Inbox");
     } catch (error) {

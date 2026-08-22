@@ -1,4 +1,10 @@
-import type { Capability } from "./types";
+import type {
+  Capability,
+  CapabilityConnection,
+  DerivedConnection,
+  LoadedContent,
+  TimeRange
+} from "./types";
 
 export function stageProgress(stage: number): number {
   return Math.max(0, Math.min(5, Math.round(stage))) * 20;
@@ -97,6 +103,92 @@ export function parseSimpleFrontmatter(markdown: string): { data: Record<string,
     }
   }
   return { data, body: markdown.slice(end + 5).replace(/^\n/, "") };
+}
+
+export function spectrumHue(seed: string): number {
+  let hash = 2166136261;
+  for (let index = 0; index < seed.length; index += 1) {
+    hash ^= seed.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0) % 360;
+}
+
+export function connectionKey(firstId: string, secondId: string): string {
+  return [firstId, secondId].sort().join("::");
+}
+
+export function calculateConnections(
+  contents: LoadedContent[],
+  pinnedConnections: CapabilityConnection[] = []
+): DerivedConnection[] {
+  const result = new Map<string, DerivedConnection>();
+  for (const item of contents.filter((content) => content.status !== "archived")) {
+    const ids = [...new Set(item.capabilityIds)].sort();
+    for (let left = 0; left < ids.length; left += 1) {
+      for (let right = left + 1; right < ids.length; right += 1) {
+        const key = connectionKey(ids[left], ids[right]);
+        const existing = result.get(key) ?? {
+          fromId: ids[left],
+          toId: ids[right],
+          pinned: false,
+          created: item.created,
+          strength: 0,
+          sharedContentIds: [],
+          counts: {}
+        };
+        existing.strength += 1;
+        existing.sharedContentIds.push(item.id);
+        existing.counts[item.type] = (existing.counts[item.type] ?? 0) + 1;
+        if (item.created < existing.created) existing.created = item.created;
+        result.set(key, existing);
+      }
+    }
+  }
+  for (const pinned of pinnedConnections) {
+    const key = connectionKey(pinned.fromId, pinned.toId);
+    if (!pinned.pinned && !result.has(key)) continue;
+    const existing = result.get(key) ?? {
+      ...pinned,
+      strength: 0,
+      sharedContentIds: [],
+      counts: {}
+    };
+    existing.pinned = pinned.pinned;
+    existing.note = pinned.note;
+    existing.created = pinned.created;
+    result.set(key, existing);
+  }
+  return [...result.values()].sort((left, right) =>
+    Number(right.pinned) - Number(left.pinned) || right.strength - left.strength || connectionKey(left.fromId, left.toId).localeCompare(connectionKey(right.fromId, right.toId))
+  );
+}
+
+export function uniqueAttachmentPath(originalName: string, exists: (path: string) => boolean, timestamp = Date.now()): string {
+  const leaf = originalName.split(/[\\/]/).pop()?.trim() || "Attachment";
+  const safe = leaf.replace(/[\\/:*?"<>|#\[\]\^]/g, " ").replace(/\s+/g, " ").trim().slice(0, 120) || "Attachment";
+  const dot = safe.lastIndexOf(".");
+  const base = dot > 0 ? safe.slice(0, dot) : safe;
+  const extension = dot > 0 ? safe.slice(dot) : "";
+  let path = "08 Attachments/" + safe;
+  if (!exists(path)) return path;
+  path = "08 Attachments/" + base + "-" + timestamp + extension;
+  let suffix = 2;
+  while (exists(path)) {
+    path = "08 Attachments/" + base + "-" + timestamp + "-" + suffix + extension;
+    suffix += 1;
+  }
+  return path;
+}
+
+export function timeRangeStart(range: TimeRange, now = new Date()): Date | null {
+  if (range === "all") return null;
+  const start = new Date(now);
+  if (range === "30d") start.setDate(start.getDate() - 30);
+  else if (range === "3m") start.setMonth(start.getMonth() - 3);
+  else if (range === "6m") start.setMonth(start.getMonth() - 6);
+  else start.setFullYear(start.getFullYear() - 1);
+  return start;
 }
 
 export function relativeTime(iso: string, now = Date.now()): string {

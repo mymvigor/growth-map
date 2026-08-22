@@ -3,7 +3,7 @@ import { TFile as RuntimeTFile, type App, type TFile } from "obsidian";
 import { DEFAULT_SETTINGS } from "../src/types";
 
 class FakeVault {
-  readonly files = new Map<string, { file: TFile; content: string }>();
+  readonly files = new Map<string, { file: TFile; content: string | ArrayBuffer }>();
   readonly folders = new Set<string>();
 
   async createFolder(path: string): Promise<void> {
@@ -15,7 +15,7 @@ class FakeVault {
   }
 
   getMarkdownFiles(): TFile[] {
-    return [...this.files.values()].map((entry) => entry.file);
+    return [...this.files.values()].map((entry) => entry.file).filter((file) => file.path.endsWith(".md"));
   }
 
   async create(path: string, content: string): Promise<TFile> {
@@ -25,8 +25,16 @@ class FakeVault {
     return file;
   }
 
+  async createBinary(path: string, content: ArrayBuffer): Promise<TFile> {
+    const FileConstructor = RuntimeTFile as unknown as new (filePath: string) => TFile;
+    const file = new FileConstructor(path);
+    this.files.set(path, { file, content });
+    return file;
+  }
+
   async cachedRead(file: TFile): Promise<string> {
-    return this.files.get(file.path)?.content ?? "";
+    const content = this.files.get(file.path)?.content;
+    return typeof content === "string" ? content : "";
   }
 
   async modify(file: TFile, content: string): Promise<void> {
@@ -98,6 +106,87 @@ describe("GrowthRepository", () => {
     expect(markdown).toContain("sourceType: \"personal-observation\"");
   });
 
+  it("reads old content Markdown without additive v1.1 fields", async () => {
+    await repository.initialize();
+    const file = await vault.create("02 Knowledge/KNOW-OLD00001 Legacy.md", `---
+gmType: "content"
+id: "KNOW-OLD00001"
+type: "knowledge"
+title: "Legacy note"
+capabilityIds: []
+status: "validated"
+confidence: "high"
+sourceType: "personal-observation"
+created: "2025-01-01T00:00:00.000Z"
+updated: "2025-01-01T00:00:00.000Z"
+---
+
+Legacy body`);
+    repository.invalidate();
+    const item = await repository.loadContent("KNOW-OLD00001");
+    expect(item?.file).toBe(file);
+    expect(item?.body).toBe("Legacy body");
+    expect(item?.attachments).toEqual([]);
+  });
+
+  it("records explicit Growth Events for content creation and stage changes", async () => {
+    await repository.initialize();
+    const optionality = (await repository.loadCapabilities()).find((item) => item.name === "Optionality");
+    expect(optionality).toBeDefined();
+    const item = await repository.createContent({
+      type: "case",
+      title: "A real case",
+      body: "A decision and result",
+      capabilityIds: [optionality!.id]
+    });
+    optionality!.stage = 3;
+    await repository.updateCapability(optionality!);
+    const events = await repository.loadGrowthEvents(null, new Date(Date.now() + 1000), true);
+    expect(events.find((event) => event.eventType === "content-created" && event.contentId === item.id)?.capabilityIds).toEqual([optionality!.id]);
+    expect(events.find((event) => event.eventType === "capability-stage-changed")).toMatchObject({
+      capabilityIds: [optionality!.id],
+      fromStage: 0,
+      toStage: 3
+    });
+  });
+
+  it("derives explainable connections and persists an optional pin note", async () => {
+    await repository.initialize();
+    const capabilities = await repository.loadCapabilities();
+    const communication = capabilities.find((item) => item.name === "Communication");
+    const optionality = capabilities.find((item) => item.name === "Optionality");
+    expect(communication).toBeDefined();
+    expect(optionality).toBeDefined();
+    await repository.createContent({
+      type: "lesson",
+      title: "Shared lesson",
+      body: "One experience links both capabilities",
+      capabilityIds: [communication!.id, optionality!.id]
+    });
+    const derived = await repository.loadConnections(true);
+    expect(derived).toHaveLength(1);
+    expect(derived[0]).toMatchObject({ strength: 1, counts: { lesson: 1 }, pinned: false });
+    await repository.pinConnection(communication!.id, optionality!.id, true, "Negotiation creates optionality");
+    const pinned = await repository.loadConnections(true);
+    expect(pinned[0]).toMatchObject({ pinned: true, note: "Negotiation creates optionality", strength: 1 });
+    expect([...vault.files.keys()].some((path) => path.startsWith("00 System/Connections/CONN-"))).toBe(true);
+  });
+
+  it("stores optional attachment metadata and resolves Vault-relative path conflicts", async () => {
+    await repository.initialize();
+    const attachment = (name: string): File => ({
+      name,
+      type: "image/png",
+      arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer
+    } as File);
+    const first = await repository.createContent({ type: "inbox", body: "First", attachmentFiles: [attachment("evidence.png")] });
+    const second = await repository.createContent({ type: "inbox", body: "Second", attachmentFiles: [attachment("evidence.png")] });
+    expect(first.attachments).toHaveLength(1);
+    expect(first.attachments?.[0]).toMatchObject({ path: "08 Attachments/evidence.png", name: "evidence.png", mimeType: "image/png" });
+    expect(second.attachments?.[0].path).not.toBe(first.attachments?.[0].path);
+    expect(second.attachments?.[0].path.startsWith("08 Attachments/evidence-")).toBe(true);
+    expect(await vault.cachedRead(first.file)).toContain('attachments: [{"path":"08 Attachments/evidence.png"');
+  });
   it("protects references, checkpoints archive, and restores the tree", async () => {
     await repository.initialize();
     const capabilities = await repository.loadCapabilities();

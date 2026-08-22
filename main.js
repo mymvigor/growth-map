@@ -120,6 +120,86 @@ function parseSimpleFrontmatter(markdown) {
   }
   return { data, body: markdown.slice(end + 5).replace(/^\n/, "") };
 }
+function spectrumHue(seed) {
+  let hash = 2166136261;
+  for (let index = 0; index < seed.length; index += 1) {
+    hash ^= seed.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0) % 360;
+}
+function connectionKey(firstId, secondId) {
+  return [firstId, secondId].sort().join("::");
+}
+function calculateConnections(contents, pinnedConnections = []) {
+  var _a, _b, _c;
+  const result = /* @__PURE__ */ new Map();
+  for (const item of contents.filter((content) => content.status !== "archived")) {
+    const ids = [...new Set(item.capabilityIds)].sort();
+    for (let left = 0; left < ids.length; left += 1) {
+      for (let right = left + 1; right < ids.length; right += 1) {
+        const key = connectionKey(ids[left], ids[right]);
+        const existing = (_a = result.get(key)) != null ? _a : {
+          fromId: ids[left],
+          toId: ids[right],
+          pinned: false,
+          created: item.created,
+          strength: 0,
+          sharedContentIds: [],
+          counts: {}
+        };
+        existing.strength += 1;
+        existing.sharedContentIds.push(item.id);
+        existing.counts[item.type] = ((_b = existing.counts[item.type]) != null ? _b : 0) + 1;
+        if (item.created < existing.created) existing.created = item.created;
+        result.set(key, existing);
+      }
+    }
+  }
+  for (const pinned of pinnedConnections) {
+    const key = connectionKey(pinned.fromId, pinned.toId);
+    if (!pinned.pinned && !result.has(key)) continue;
+    const existing = (_c = result.get(key)) != null ? _c : {
+      ...pinned,
+      strength: 0,
+      sharedContentIds: [],
+      counts: {}
+    };
+    existing.pinned = pinned.pinned;
+    existing.note = pinned.note;
+    existing.created = pinned.created;
+    result.set(key, existing);
+  }
+  return [...result.values()].sort(
+    (left, right) => Number(right.pinned) - Number(left.pinned) || right.strength - left.strength || connectionKey(left.fromId, left.toId).localeCompare(connectionKey(right.fromId, right.toId))
+  );
+}
+function uniqueAttachmentPath(originalName, exists, timestamp = Date.now()) {
+  var _a;
+  const leaf = ((_a = originalName.split(/[\\/]/).pop()) == null ? void 0 : _a.trim()) || "Attachment";
+  const safe = leaf.replace(/[\\/:*?"<>|#\[\]\^]/g, " ").replace(/\s+/g, " ").trim().slice(0, 120) || "Attachment";
+  const dot = safe.lastIndexOf(".");
+  const base = dot > 0 ? safe.slice(0, dot) : safe;
+  const extension = dot > 0 ? safe.slice(dot) : "";
+  let path = "08 Attachments/" + safe;
+  if (!exists(path)) return path;
+  path = "08 Attachments/" + base + "-" + timestamp + extension;
+  let suffix = 2;
+  while (exists(path)) {
+    path = "08 Attachments/" + base + "-" + timestamp + "-" + suffix + extension;
+    suffix += 1;
+  }
+  return path;
+}
+function timeRangeStart(range, now = /* @__PURE__ */ new Date()) {
+  if (range === "all") return null;
+  const start = new Date(now);
+  if (range === "30d") start.setDate(start.getDate() - 30);
+  else if (range === "3m") start.setMonth(start.getMonth() - 3);
+  else if (range === "6m") start.setMonth(start.getMonth() - 6);
+  else start.setFullYear(start.getFullYear() - 1);
+  return start;
+}
 function relativeTime(iso, now = Date.now()) {
   const delta = Math.max(0, now - new Date(iso).getTime());
   const minutes = Math.floor(delta / 6e4);
@@ -245,6 +325,7 @@ var QuickCaptureModal = class extends import_obsidian.Modal {
     super(app);
     this.contextName = contextName;
     this.onSave = onSave;
+    this.selectedFiles = [];
   }
   onOpen() {
     this.modalEl.addClass("gm-modal", "gm-capture-modal");
@@ -257,6 +338,23 @@ var QuickCaptureModal = class extends import_obsidian.Modal {
     const details = this.contentEl.createEl("details", { cls: "gm-optional-title" });
     details.createEl("summary", { text: "Add a title (optional)" });
     const title = details.createEl("input", { cls: "gm-text-input", attr: { type: "text", placeholder: "Title" } });
+    const attachmentInput = this.contentEl.createEl("input", {
+      cls: "gm-file-input",
+      attr: {
+        type: "file",
+        accept: ".jpg,.jpeg,.png,.webp,.gif,.pdf,.doc,.docx,.txt,.md,image/jpeg,image/png,image/webp,image/gif,application/pdf,text/plain,text/markdown"
+      }
+    });
+    attachmentInput.multiple = true;
+    const attachmentRow = this.contentEl.createDiv("gm-capture-attachment-row");
+    const addAttachment = attachmentRow.createEl("button", { text: "Add Attachment", cls: "gm-attachment-picker" });
+    const attachmentSummary = attachmentRow.createSpan({ text: "Optional", cls: "gm-muted" });
+    addAttachment.addEventListener("click", () => attachmentInput.click());
+    attachmentInput.addEventListener("change", () => {
+      var _a;
+      this.selectedFiles = Array.from((_a = attachmentInput.files) != null ? _a : []);
+      attachmentSummary.setText(this.selectedFiles.length ? `${this.selectedFiles.length} selected` : "Optional");
+    });
     const actions = this.contentEl.createDiv("gm-modal-actions");
     actions.createEl("button", { text: "Cancel" }).addEventListener("click", () => this.close());
     const save = actions.createEl("button", { text: "Save to Inbox", cls: "mod-cta" });
@@ -273,7 +371,7 @@ var QuickCaptureModal = class extends import_obsidian.Modal {
     }
     button.disabled = true;
     try {
-      await this.onSave(title.trim(), content.trim());
+      await this.onSave(title.trim(), content.trim(), this.selectedFiles);
       this.close();
       new import_obsidian.Notice("Saved to Growth Map Inbox");
     } catch (error) {
@@ -437,6 +535,8 @@ var import_obsidian2 = require("obsidian");
 var FOLDERS = [
   "00 System",
   "00 System/Checkpoints",
+  "00 System/Growth Events",
+  "00 System/Connections",
   "01 Capabilities",
   "02 Knowledge",
   "03 Cases",
@@ -444,6 +544,7 @@ var FOLDERS = [
   "05 Lessons",
   "06 Questions",
   "07 Inbox",
+  "08 Attachments",
   "99 Archive"
 ];
 var CONTENT_FOLDERS = {
@@ -463,6 +564,10 @@ var CONTENT_PREFIXES = {
   inbox: "INBOX"
 };
 var MANAGED_CONTENT_FOLDERS = Object.values(CONTENT_FOLDERS);
+var GROWTH_EVENT_FOLDER = "00 System/Growth Events";
+var CONNECTION_FOLDER = "00 System/Connections";
+var ATTACHMENT_FOLDER = "08 Attachments";
+var ALLOWED_ATTACHMENT_EXTENSIONS = /* @__PURE__ */ new Set(["jpg", "jpeg", "png", "webp", "gif", "pdf", "doc", "docx", "txt", "md"]);
 function nowIso() {
   return (/* @__PURE__ */ new Date()).toISOString();
 }
@@ -478,8 +583,30 @@ function boolValue(value, fallback = false) {
 function stringArray(value) {
   return Array.isArray(value) ? value.filter((item) => typeof item === "string") : [];
 }
+function attachmentArray(value) {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const data = item;
+    const path = stringValue(data.path);
+    const name = stringValue(data.name);
+    const added = stringValue(data.added);
+    if (!path || !name || !added || path.startsWith("/") || /^[A-Za-z]:[\\/]/.test(path) || path.split(/[\\/]/).includes("..")) return [];
+    return [{ path, name, added, mimeType: typeof data.mimeType === "string" ? data.mimeType : void 0 }];
+  });
+}
+function metadataValue(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return void 0;
+  const entries = Object.entries(value).filter(
+    (entry) => entry[1] === null || ["string", "number", "boolean"].includes(typeof entry[1])
+  );
+  return entries.length ? Object.fromEntries(entries) : void 0;
+}
 function yamlLine(key, value) {
   return `${key}: ${value === null ? "null" : typeof value === "string" || Array.isArray(value) ? JSON.stringify(value) : String(value)}`;
+}
+function jsonLine(key, value) {
+  return `${key}: ${JSON.stringify(value)}`;
 }
 function capabilityMarkdown(capability, existingBody) {
   const body = existingBody ? existingBody.replace(/^# .+$/m, `# ${capability.name}`).trim() : [`# ${capability.name}`, "", "> Managed by Growth Map. You can add notes below; keep the frontmatter fields intact."].join("\n");
@@ -503,6 +630,7 @@ function capabilityMarkdown(capability, existingBody) {
   ].join("\n");
 }
 function contentMarkdown(item) {
+  var _a;
   const lines = [
     "---",
     yamlLine("gmType", "content"),
@@ -518,6 +646,7 @@ function contentMarkdown(item) {
   ];
   if (item.previousStatus) lines.push(yamlLine("previousStatus", item.previousStatus));
   if (item.demo) lines.push(yamlLine("demo", true));
+  if ((_a = item.attachments) == null ? void 0 : _a.length) lines.push(yamlLine("attachments", item.attachments));
   lines.push("---", "", item.body.trim(), "");
   return lines.join("\n");
 }
@@ -556,6 +685,7 @@ function contentFromData(data, body, file) {
     updated: stringValue(data.updated, nowIso()),
     previousStatus: allowedStatuses.includes(data.previousStatus) ? data.previousStatus : void 0,
     demo: boolValue(data.demo),
+    attachments: attachmentArray(data.attachments),
     body,
     file
   };
@@ -563,6 +693,67 @@ function contentFromData(data, body, file) {
 function parseContent(markdown, file) {
   const { data, body } = parseSimpleFrontmatter(markdown);
   return contentFromData(data, body, file);
+}
+function cloneContent(item) {
+  var _a;
+  return {
+    ...item,
+    capabilityIds: [...item.capabilityIds],
+    attachments: (_a = item.attachments) == null ? void 0 : _a.map((attachment) => ({ ...attachment }))
+  };
+}
+function growthEventMarkdown(event) {
+  const lines = [
+    "---",
+    yamlLine("gmType", "growth-event"),
+    yamlLine("id", event.id),
+    yamlLine("timestamp", event.timestamp),
+    yamlLine("eventType", event.eventType),
+    yamlLine("capabilityIds", event.capabilityIds)
+  ];
+  if (event.contentId) lines.push(yamlLine("contentId", event.contentId));
+  if (event.fromStage !== void 0) lines.push(yamlLine("fromStage", event.fromStage));
+  if (event.toStage !== void 0) lines.push(yamlLine("toStage", event.toStage));
+  if (event.metadata) lines.push(jsonLine("metadata", event.metadata));
+  lines.push("---", "", "# Growth Event", "", "Recorded automatically by Growth Map.", "");
+  return lines.join("\n");
+}
+function growthEventFromData(data) {
+  const eventTypes = ["capability-stage-changed", "content-created", "content-converted", "focus-added", "focus-removed"];
+  if (data.gmType !== "growth-event" || typeof data.id !== "string" || !eventTypes.includes(data.eventType)) return null;
+  return {
+    id: data.id,
+    timestamp: stringValue(data.timestamp),
+    eventType: data.eventType,
+    capabilityIds: stringArray(data.capabilityIds),
+    contentId: typeof data.contentId === "string" ? data.contentId : void 0,
+    fromStage: typeof data.fromStage === "number" ? data.fromStage : void 0,
+    toStage: typeof data.toStage === "number" ? data.toStage : void 0,
+    metadata: metadataValue(data.metadata)
+  };
+}
+function connectionMarkdown(connection) {
+  const lines = [
+    "---",
+    yamlLine("gmType", "capability-connection"),
+    yamlLine("fromId", connection.fromId),
+    yamlLine("toId", connection.toId),
+    yamlLine("pinned", connection.pinned),
+    yamlLine("created", connection.created)
+  ];
+  if (connection.note) lines.push(yamlLine("note", connection.note));
+  lines.push("---", "", "# Capability Connection", "", "> Observed association. Pinning does not assert causation or dependency.", "");
+  return lines.join("\n");
+}
+function connectionFromData(data) {
+  if (data.gmType !== "capability-connection" || typeof data.fromId !== "string" || typeof data.toId !== "string") return null;
+  return {
+    fromId: data.fromId,
+    toId: data.toId,
+    pinned: boolValue(data.pinned),
+    note: typeof data.note === "string" ? data.note : void 0,
+    created: stringValue(data.created, nowIso())
+  };
 }
 function templateFor(type, seed = "") {
   const value = seed.trim();
@@ -704,16 +895,25 @@ var GrowthRepository = class {
     this.capabilityCache = null;
     this.contentCache = null;
     this.contentMetadataCache = null;
+    this.growthEventCache = /* @__PURE__ */ new Map();
+    this.pinnedConnectionCache = null;
+    this.connectionCache = null;
   }
   invalidate(path) {
     if (!path || path.startsWith("01 Capabilities/")) this.capabilityCache = null;
     if (!path || MANAGED_CONTENT_FOLDERS.some((folder) => path.startsWith(`${folder}/`))) {
       this.contentCache = null;
       this.contentMetadataCache = null;
+      this.connectionCache = null;
+    }
+    if (!path || path.startsWith(`${GROWTH_EVENT_FOLDER}/`)) this.growthEventCache.clear();
+    if (!path || path.startsWith(`${CONNECTION_FOLDER}/`)) {
+      this.pinnedConnectionCache = null;
+      this.connectionCache = null;
     }
   }
   isManagedPath(path) {
-    return path.startsWith("01 Capabilities/") || MANAGED_CONTENT_FOLDERS.some((folder) => path.startsWith(`${folder}/`));
+    return path.startsWith("01 Capabilities/") || MANAGED_CONTENT_FOLDERS.some((folder) => path.startsWith(`${folder}/`)) || path.startsWith(`${GROWTH_EVENT_FOLDER}/`) || path.startsWith(`${CONNECTION_FOLDER}/`);
   }
   async isInitialized() {
     if (this.app.vault.getAbstractFileByPath("00 System/Growth Map Initialized.md") instanceof import_obsidian2.TFile) return true;
@@ -793,10 +993,25 @@ var GrowthRepository = class {
     return capability;
   }
   async updateCapability(capability, structural = false, label = "Update capability") {
+    const before = (await this.loadCapabilities()).find((item) => item.id === capability.id);
     if (structural && this.getSettings().checkpointBeforeChanges) await this.createCheckpoint(label);
     capability.updated = nowIso();
     await this.writeCapability(capability);
     this.invalidate();
+    if (before && before.stage !== capability.stage) {
+      await this.recordEventSafely({
+        eventType: "capability-stage-changed",
+        capabilityIds: [capability.id],
+        fromStage: before.stage,
+        toStage: capability.stage
+      });
+    }
+    if (before && before.focus !== capability.focus) {
+      await this.recordEventSafely({
+        eventType: capability.focus ? "focus-added" : "focus-removed",
+        capabilityIds: [capability.id]
+      });
+    }
   }
   async moveCapability(id, parentId) {
     const capabilities = await this.loadCapabilities();
@@ -957,7 +1172,7 @@ var GrowthRepository = class {
     return checkpoint.path;
   }
   async loadContents(force = false) {
-    if (this.contentCache && !force) return this.contentCache.map((item) => ({ ...item, capabilityIds: [...item.capabilityIds] }));
+    if (this.contentCache && !force) return this.contentCache.map(cloneContent);
     const files = this.app.vault.getMarkdownFiles().filter((file) => MANAGED_CONTENT_FOLDERS.some((folder) => file.path.startsWith(`${folder}/`)));
     const contents = [];
     for (const file of files) {
@@ -965,11 +1180,11 @@ var GrowthRepository = class {
       if (item) contents.push(item);
     }
     this.contentCache = contents;
-    return contents.map((item) => ({ ...item, capabilityIds: [...item.capabilityIds] }));
+    return contents.map(cloneContent);
   }
   async loadContentMetadata(force = false) {
     var _a;
-    if (this.contentMetadataCache && !force) return this.contentMetadataCache.map((item) => ({ ...item, capabilityIds: [...item.capabilityIds] }));
+    if (this.contentMetadataCache && !force) return this.contentMetadataCache.map(cloneContent);
     const files = this.app.vault.getMarkdownFiles().filter((file) => MANAGED_CONTENT_FOLDERS.some((folder) => file.path.startsWith(`${folder}/`)));
     const contents = [];
     for (const file of files) {
@@ -978,7 +1193,7 @@ var GrowthRepository = class {
       if (item) contents.push(item);
     }
     this.contentMetadataCache = contents;
-    return contents.map((item) => ({ ...item, capabilityIds: [...item.capabilityIds] }));
+    return contents.map(cloneContent);
   }
   async loadContent(id) {
     const metadata = (await this.loadContentMetadata()).find((item) => item.id === id);
@@ -990,24 +1205,33 @@ var GrowthRepository = class {
     return null;
   }
   async createContent(input) {
-    var _a, _b, _c, _d, _e, _f;
+    var _a, _b, _c, _d, _e, _f, _g, _h;
     await this.ensureFolder(CONTENT_FOLDERS[input.type]);
     const timestamp = nowIso();
     const title = (_b = (_a = input.title) == null ? void 0 : _a.trim()) != null ? _b : "";
+    const savedAttachments = ((_c = input.attachmentFiles) == null ? void 0 : _c.length) ? await this.saveAttachmentFiles(input.attachmentFiles) : [];
+    const attachments = [...(_d = input.attachments) != null ? _d : [], ...savedAttachments];
     const item = {
       id: makeId(CONTENT_PREFIXES[input.type]),
       type: input.type,
       title,
       body: input.type === "inbox" ? input.body.trim() : templateFor(input.type, input.body),
-      capabilityIds: [...new Set((_c = input.capabilityIds) != null ? _c : [])],
-      status: (_d = input.status) != null ? _d : input.type === "hypothesis" ? "validating" : "draft",
-      confidence: (_e = input.confidence) != null ? _e : "low",
-      sourceType: (_f = input.sourceType) != null ? _f : "personal-observation",
+      capabilityIds: [...new Set((_e = input.capabilityIds) != null ? _e : [])],
+      status: (_f = input.status) != null ? _f : input.type === "hypothesis" ? "validating" : "draft",
+      confidence: (_g = input.confidence) != null ? _g : "low",
+      sourceType: (_h = input.sourceType) != null ? _h : "personal-observation",
       created: timestamp,
-      updated: timestamp
+      updated: timestamp,
+      attachments: attachments.length ? attachments : void 0
     };
     const file = await this.app.vault.create(this.contentPath(item), contentMarkdown(item));
     this.invalidate(file.path);
+    await this.recordEventSafely({
+      eventType: "content-created",
+      capabilityIds: item.capabilityIds,
+      contentId: item.id,
+      metadata: { contentType: item.type }
+    });
     return { ...item, file };
   }
   async updateContent(item) {
@@ -1024,11 +1248,19 @@ var GrowthRepository = class {
   }
   async convertInbox(item, type) {
     if (item.type !== "inbox") return item;
+    const previousId = item.id;
     item.type = type;
     item.id = makeId(CONTENT_PREFIXES[type]);
     item.status = type === "hypothesis" ? "validating" : "draft";
     item.body = templateFor(type, item.body);
-    return this.updateContent(item);
+    const converted = await this.updateContent(item);
+    await this.recordEventSafely({
+      eventType: "content-converted",
+      capabilityIds: item.capabilityIds,
+      contentId: item.id,
+      metadata: { fromType: "inbox", toType: type, previousId }
+    });
+    return converted;
   }
   async archiveContent(item) {
     item.previousStatus = item.status;
@@ -1039,6 +1271,117 @@ var GrowthRepository = class {
     item.status = item.previousStatus && item.previousStatus !== "archived" ? item.previousStatus : "draft";
     item.previousStatus = void 0;
     await this.updateContent(item);
+  }
+  async saveAttachmentFiles(files) {
+    var _a, _b;
+    const unsupported = files.find((file) => {
+      var _a2, _b2;
+      return !ALLOWED_ATTACHMENT_EXTENSIONS.has((_b2 = (_a2 = file.name.split(".").pop()) == null ? void 0 : _a2.toLocaleLowerCase()) != null ? _b2 : "");
+    });
+    if (unsupported) throw new Error(`Unsupported attachment type: ${unsupported.name}`);
+    await this.ensureFolder(ATTACHMENT_FOLDER);
+    const saved = [];
+    for (const file of files) {
+      const extension = (_b = (_a = file.name.split(".").pop()) == null ? void 0 : _a.toLocaleLowerCase()) != null ? _b : "";
+      if (!ALLOWED_ATTACHMENT_EXTENSIONS.has(extension)) throw new Error(`Unsupported attachment type: ${file.name}`);
+      const path = (0, import_obsidian2.normalizePath)(uniqueAttachmentPath(file.name, (candidate) => Boolean(this.app.vault.getAbstractFileByPath(candidate))));
+      const created = await this.app.vault.createBinary(path, await file.arrayBuffer());
+      saved.push({ path: created.path, name: file.name, mimeType: file.type || void 0, added: nowIso() });
+    }
+    return saved;
+  }
+  async recordGrowthEvent(input) {
+    var _a, _b;
+    const event = {
+      ...input,
+      id: (_a = input.id) != null ? _a : makeId("EVT"),
+      timestamp: (_b = input.timestamp) != null ? _b : nowIso(),
+      capabilityIds: [...new Set(input.capabilityIds)]
+    };
+    const monthFolder = (0, import_obsidian2.normalizePath)(`${GROWTH_EVENT_FOLDER}/${event.timestamp.slice(0, 7)}`);
+    await this.ensureFolder(GROWTH_EVENT_FOLDER);
+    await this.ensureFolder(monthFolder);
+    const stamp = event.timestamp.replace(/[:.]/g, "-");
+    let path = (0, import_obsidian2.normalizePath)(`${monthFolder}/${stamp} ${event.id}.md`);
+    let suffix = 2;
+    while (this.app.vault.getAbstractFileByPath(path)) {
+      path = (0, import_obsidian2.normalizePath)(`${monthFolder}/${stamp} ${event.id}-${suffix}.md`);
+      suffix += 1;
+    }
+    await this.app.vault.create(path, growthEventMarkdown(event));
+    this.invalidate(path);
+    return event;
+  }
+  async loadGrowthEvents(start, end = /* @__PURE__ */ new Date(), force = false) {
+    var _a, _b;
+    const cacheKey = `${(_a = start == null ? void 0 : start.toISOString()) != null ? _a : "all"}|${end.toISOString()}`;
+    const cached = this.growthEventCache.get(cacheKey);
+    if (cached && !force) return cached.map((event) => ({ ...event, capabilityIds: [...event.capabilityIds], metadata: event.metadata ? { ...event.metadata } : void 0 }));
+    const startMonth = start == null ? void 0 : start.toISOString().slice(0, 7);
+    const endMonth = end.toISOString().slice(0, 7);
+    const files = this.app.vault.getMarkdownFiles().filter((file) => {
+      if (!file.path.startsWith(`${GROWTH_EVENT_FOLDER}/`)) return false;
+      const month = file.path.slice(GROWTH_EVENT_FOLDER.length + 1, GROWTH_EVENT_FOLDER.length + 8);
+      return (!startMonth || month >= startMonth) && month <= endMonth;
+    });
+    const events = [];
+    for (const file of files) {
+      const cachedData = (_b = this.app.metadataCache.getFileCache(file)) == null ? void 0 : _b.frontmatter;
+      const data = cachedData != null ? cachedData : parseSimpleFrontmatter(await this.app.vault.cachedRead(file)).data;
+      const event = growthEventFromData(data);
+      if (!event) continue;
+      const time = new Date(event.timestamp).getTime();
+      if ((!start || time >= start.getTime()) && time <= end.getTime()) events.push(event);
+    }
+    events.sort((left, right) => right.timestamp.localeCompare(left.timestamp));
+    this.growthEventCache.set(cacheKey, events);
+    return events.map((event) => ({ ...event, capabilityIds: [...event.capabilityIds], metadata: event.metadata ? { ...event.metadata } : void 0 }));
+  }
+  async loadPinnedConnections(force = false) {
+    var _a;
+    if (this.pinnedConnectionCache && !force) return this.pinnedConnectionCache.map((item) => ({ ...item }));
+    const connections = [];
+    for (const file of this.app.vault.getMarkdownFiles().filter((candidate) => candidate.path.startsWith(`${CONNECTION_FOLDER}/`))) {
+      const cached = (_a = this.app.metadataCache.getFileCache(file)) == null ? void 0 : _a.frontmatter;
+      const data = cached != null ? cached : parseSimpleFrontmatter(await this.app.vault.cachedRead(file)).data;
+      const connection = connectionFromData(data);
+      if (connection) connections.push(connection);
+    }
+    this.pinnedConnectionCache = connections;
+    return connections.map((item) => ({ ...item }));
+  }
+  async loadConnections(force = false) {
+    if (this.connectionCache && !force) return this.connectionCache.map((item) => ({ ...item, sharedContentIds: [...item.sharedContentIds], counts: { ...item.counts } }));
+    const connections = calculateConnections(await this.loadContentMetadata(), await this.loadPinnedConnections());
+    this.connectionCache = connections;
+    return connections.map((item) => ({ ...item, sharedContentIds: [...item.sharedContentIds], counts: { ...item.counts } }));
+  }
+  async pinConnection(firstId, secondId, pinned, note) {
+    var _a;
+    if (firstId === secondId) throw new Error("A capability cannot connect to itself");
+    await this.ensureFolder(CONNECTION_FOLDER);
+    const [fromId, toId] = connectionKey(firstId, secondId).split("::");
+    const existing = (await this.loadPinnedConnections()).find((item) => connectionKey(item.fromId, item.toId) === connectionKey(fromId, toId));
+    const connection = {
+      fromId,
+      toId,
+      pinned,
+      note: (note == null ? void 0 : note.trim()) || (existing == null ? void 0 : existing.note),
+      created: (_a = existing == null ? void 0 : existing.created) != null ? _a : nowIso()
+    };
+    const path = (0, import_obsidian2.normalizePath)(`${CONNECTION_FOLDER}/CONN-${fromId}--${toId}.md`);
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (file instanceof import_obsidian2.TFile) await this.app.vault.modify(file, connectionMarkdown(connection));
+    else await this.app.vault.create(path, connectionMarkdown(connection));
+    this.invalidate(path);
+    return connection;
+  }
+  async recordEventSafely(input) {
+    try {
+      await this.recordGrowthEvent(input);
+    } catch (error) {
+      this.log(`Could not record Growth Event: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
   async moveReferences(sourceIds, targetId) {
     const sourceSet = new Set(sourceIds);
@@ -1126,6 +1469,9 @@ var GrowthMapView = class extends import_obsidian4.ItemView {
     super(leaf);
     this.plugin = plugin;
     this.page = "home";
+    this.mapMode = "tree";
+    this.timeRange = "3m";
+    this.selectedConnectionKey = null;
     this.selectedCapabilityId = null;
     this.selectedContentId = null;
     this.expanded = /* @__PURE__ */ new Set();
@@ -1190,6 +1536,7 @@ var GrowthMapView = class extends import_obsidian4.ItemView {
     this.page = page;
     if (page === "capability") this.selectedCapabilityId = id != null ? id : null;
     if (page === "content") this.selectedContentId = id != null ? id : null;
+    if (page === "connection") this.selectedConnectionKey = id != null ? id : null;
     await this.render();
   }
   async openSearch() {
@@ -1213,11 +1560,13 @@ var GrowthMapView = class extends import_obsidian4.ItemView {
       const scroll = shell.createDiv("gm-scroll");
       if (this.page === "home") await this.renderHome(scroll);
       else if (this.page === "map") await this.renderMap(scroll);
+      else if (this.page === "timeline") await this.renderTimeline(scroll);
       else if (this.page === "library") await this.renderLibrary(scroll);
       else if (this.page === "ai") this.renderAI(scroll);
       else if (this.page === "archive") await this.renderArchive(scroll);
       else if (this.page === "capability") await this.renderCapability(scroll);
       else if (this.page === "content") await this.renderContent(scroll);
+      else if (this.page === "connection") await this.renderConnectionDetail(scroll);
       this.renderFab(shell);
       this.renderNavigation(shell);
       this.scheduleBottomOffsetUpdate();
@@ -1334,6 +1683,8 @@ var GrowthMapView = class extends import_obsidian4.ItemView {
   async renderHome(container) {
     const capabilities = await this.plugin.repository.loadCapabilities();
     const contents = await this.plugin.repository.loadContentMetadata();
+    const monthStart = timeRangeStart("30d");
+    const monthEvents = await this.plugin.repository.loadGrowthEvents(monthStart);
     const active = capabilities.filter((item) => item.status === "active");
     const roots = active.filter((item) => item.parentId === null).sort((a, b) => a.order - b.order);
     this.renderPageHeader(container, "My Growth", "GROWTH MAP", void 0, { icon: "archive", label: "Open archive", run: () => void this.navigate("archive") });
@@ -1347,6 +1698,7 @@ var GrowthMapView = class extends import_obsidian4.ItemView {
     for (const root of roots) {
       const progress = progressFor(root.id, active);
       const card = areaGrid.createEl("button", { cls: "gm-area-card" });
+      this.applySpectrum(card, root.id, capabilities);
       const top = card.createDiv("gm-card-top");
       top.createEl("span", { text: root.name });
       top.createEl("strong", { text: `${progress}%` });
@@ -1358,6 +1710,17 @@ var GrowthMapView = class extends import_obsidian4.ItemView {
     (0, import_obsidian4.setIcon)(addIcon, "plus");
     addArea.createSpan({ text: "Add area" });
     addArea.addEventListener("click", () => void this.addCapability(null));
+    const recordedContentIds = new Set(monthEvents.filter((event) => event.eventType === "content-created" && event.contentId).map((event) => event.contentId));
+    const legacyNewItems = contents.filter((item) => item.created >= monthStart.toISOString() && !recordedContentIds.has(item.id)).length;
+    const newItems = recordedContentIds.size + legacyNewItems;
+    const stageChanges = monthEvents.filter((event) => event.eventType === "capability-stage-changed").length;
+    const month = container.createEl("button", { cls: "gm-month-card" });
+    const monthText = month.createDiv();
+    monthText.createEl("strong", { text: "This Month" });
+    monthText.createSpan({ text: `${newItems} new item${newItems === 1 ? "" : "s"} \xB7 ${stageChanges} stage change${stageChanges === 1 ? "" : "s"}` });
+    const monthArrow = month.createSpan();
+    (0, import_obsidian4.setIcon)(monthArrow, "chevron-right");
+    month.addEventListener("click", () => void this.navigate("timeline"));
     const focus = active.filter((item) => item.focus).slice(0, 5);
     this.sectionTitle(container, "Focus", focus.length ? void 0 : "Choose up to five capabilities");
     if (focus.length === 0) {
@@ -1388,7 +1751,19 @@ var GrowthMapView = class extends import_obsidian4.ItemView {
   async renderMap(container) {
     var _a;
     const capabilities = (await this.plugin.repository.loadCapabilities()).filter((item) => item.status === "active");
-    this.renderPageHeader(container, "Capability Map", "MY GROWTH", void 0, { icon: "plus", label: "Add root area", run: () => void this.addCapability(null) });
+    this.renderPageHeader(container, "Growth Map", "MY GROWTH", void 0, { icon: "plus", label: "Add root area", run: () => void this.addCapability(null) });
+    const modes = container.createDiv("gm-segmented");
+    for (const mode of ["tree", "connections"]) {
+      const button = modes.createEl("button", { text: mode === "tree" ? "Tree" : "Connections", cls: this.mapMode === mode ? "is-active" : "" });
+      button.addEventListener("click", () => {
+        this.mapMode = mode;
+        void this.render();
+      });
+    }
+    if (this.mapMode === "connections") {
+      await this.renderConnections(container, capabilities);
+      return;
+    }
     const summary = container.createDiv("gm-map-summary");
     summary.createSpan({ text: "My Growth" });
     summary.createEl("strong", { text: `${progressFor(null, capabilities)}%` });
@@ -1407,6 +1782,7 @@ var GrowthMapView = class extends import_obsidian4.ItemView {
     const children = this.childrenOf(capability.id, capabilities);
     const row = container.createDiv("gm-tree-row");
     row.style.setProperty("--gm-depth", String(Math.min(depth, 3)));
+    this.applySpectrum(row, capability.id, capabilities);
     const toggle = row.createEl("button", { cls: "gm-tree-toggle", attr: { "aria-label": children.length ? "Expand or collapse" : "No children" } });
     if (children.length) (0, import_obsidian4.setIcon)(toggle, this.expanded.has(capability.id) ? "chevron-down" : "chevron-right");
     else toggle.createSpan({ text: "\xB7" });
@@ -1450,6 +1826,7 @@ var GrowthMapView = class extends import_obsidian4.ItemView {
     const children = this.childrenOf(capability.id, capabilities);
     const progress = progressFor(capability.id, capabilities);
     const hero = container.createDiv("gm-capability-hero");
+    this.applySpectrum(hero, capability.id, capabilities);
     hero.createEl("strong", { text: `${progress}%`, cls: "gm-progress-number" });
     this.progressBar(hero, progress);
     if (children.length === 0) {
@@ -1492,12 +1869,215 @@ var GrowthMapView = class extends import_obsidian4.ItemView {
         void this.navigate("library");
       });
     }
+    const recentEvents = (await this.plugin.repository.loadGrowthEvents(timeRangeStart("3m"))).filter(
+      (event) => event.capabilityIds.some((id) => relevantIds.has(id))
+    ).slice(0, 3);
+    if (recentEvents.length) {
+      this.sectionTitle(container, "Recent Growth");
+      const growth = container.createDiv("gm-growth-list is-compact");
+      for (const event of recentEvents) this.renderGrowthRow(growth, { ...event, recorded: true }, capabilities, contents);
+    }
+    const connections = (await this.plugin.repository.loadConnections()).filter(
+      (item) => (item.strength > 0 || item.pinned) && (item.fromId === capability.id || item.toId === capability.id)
+    ).slice(0, 5);
+    if (connections.length) {
+      this.sectionTitle(container, "Connected Capabilities");
+      const connectionList = container.createDiv("gm-connected-list");
+      for (const connection of connections) {
+        const otherId = connection.fromId === capability.id ? connection.toId : connection.fromId;
+        const other = capabilities.find((item) => item.id === otherId);
+        if (!other) continue;
+        const row = connectionList.createEl("button", { cls: "gm-connected-row" });
+        this.applySpectrum(row, other.id, capabilities);
+        const text = row.createDiv();
+        text.createEl("strong", { text: other.name });
+        text.createSpan({ text: capabilityPath(other.id, capabilities).slice(0, -1).map((item) => item.name).join(" / ") || "Root area" });
+        row.createEl("b", { text: String(connection.strength) });
+        row.addEventListener("click", () => void this.navigate("connection", connectionKey(connection.fromId, connection.toId)));
+      }
+    }
     this.sectionTitle(container, "Recent Content");
     const recent = related.sort((a, b) => b.updated.localeCompare(a.updated)).slice(0, 4);
     if (recent.length) this.renderContentCards(container, recent, capabilities);
     else this.emptyState(container, "Capture something here and it will be linked automatically.");
     const add = container.createEl("button", { text: "+  Add", cls: "gm-inline-add" });
     add.addEventListener("click", () => this.openContentForm([capability.id]));
+  }
+  async renderTimeline(container) {
+    var _a, _b, _c, _d;
+    const capabilities = (await this.plugin.repository.loadCapabilities()).filter((item) => item.status === "active");
+    const contents = (await this.plugin.repository.loadContentMetadata()).filter((item) => item.status !== "archived");
+    const start = timeRangeStart(this.timeRange);
+    const events = await this.plugin.repository.loadGrowthEvents(start);
+    const recordedContentIds = new Set(events.filter((event) => event.eventType === "content-created" && event.contentId).map((event) => event.contentId));
+    const activities = events.map((event) => ({ ...event, recorded: true }));
+    for (const item of contents) {
+      if (start && new Date(item.created) < start || recordedContentIds.has(item.id)) continue;
+      activities.push({
+        timestamp: item.created,
+        eventType: "historical-content",
+        capabilityIds: item.capabilityIds,
+        contentId: item.id,
+        recorded: false,
+        metadata: { contentType: item.type }
+      });
+    }
+    activities.sort((left, right) => right.timestamp.localeCompare(left.timestamp));
+    this.renderPageHeader(container, "Growth Over Time", "TIMELINE");
+    const ranges = container.createDiv("gm-range-chips");
+    for (const range of ["30d", "3m", "6m", "1y", "all"]) {
+      const label = range === "all" ? "All" : range.toUpperCase();
+      const button = ranges.createEl("button", { text: label, cls: this.timeRange === range ? "is-active" : "" });
+      button.addEventListener("click", () => {
+        this.timeRange = range;
+        void this.render();
+      });
+    }
+    const last30Start = timeRangeStart("30d");
+    const last30Events = this.timeRange === "30d" ? events : await this.plugin.repository.loadGrowthEvents(last30Start);
+    const last30Recorded = new Set(last30Events.filter((event) => event.eventType === "content-created" && event.contentId).map((event) => event.contentId));
+    const last30Items = last30Recorded.size + contents.filter((item) => item.created >= last30Start.toISOString() && !last30Recorded.has(item.id)).length;
+    const last30Stages = last30Events.filter((event) => event.eventType === "capability-stage-changed").length;
+    const activeCounts = /* @__PURE__ */ new Map();
+    for (const activity of activities.filter((item) => item.timestamp >= last30Start.toISOString())) {
+      for (const id of activity.capabilityIds) {
+        const root = capabilityPath(id, capabilities)[0];
+        if (root) activeCounts.set(root.id, ((_a = activeCounts.get(root.id)) != null ? _a : 0) + 1);
+      }
+    }
+    const mostActiveId = (_b = [...activeCounts].sort((left, right) => right[1] - left[1])[0]) == null ? void 0 : _b[0];
+    const mostActive = (_d = (_c = capabilities.find((item) => item.id === mostActiveId)) == null ? void 0 : _c.name) != null ? _d : "\u2014";
+    const summary = container.createDiv("gm-time-summary");
+    this.timeSummary(summary, String(last30Items), "new items");
+    this.timeSummary(summary, String(last30Stages), "stage changes");
+    this.timeSummary(summary, mostActive, "most active");
+    const roots = capabilities.filter((item) => item.parentId === null).sort((left, right) => left.order - right.order);
+    const focus = capabilities.filter((item) => item.focus && item.parentId !== null);
+    const rows = [...roots, ...focus].filter((item, index, all) => all.findIndex((candidate) => candidate.id === item.id) === index);
+    const buckets = this.timelineBuckets(start, activities);
+    this.sectionTitle(container, "Time Map", "activity \xB7 stage change");
+    if (!activities.length) this.emptyState(container, "Changes recorded from v1.1.0 will appear here.");
+    else {
+      const map = container.createDiv("gm-time-map");
+      const header = map.createDiv("gm-time-map-header");
+      header.createSpan();
+      for (const bucket of buckets) header.createSpan({ text: bucket.label });
+      for (const rowCapability of rows) {
+        const row = map.createDiv("gm-time-map-row");
+        this.applySpectrum(row, rowCapability.id, capabilities);
+        const label = row.createEl("button", { text: rowCapability.name, cls: "gm-time-row-label" });
+        label.addEventListener("click", () => void this.navigate("capability", rowCapability.id));
+        const relatedIds = descendantsOf(rowCapability.id, capabilities);
+        relatedIds.add(rowCapability.id);
+        for (const bucket of buckets) {
+          const cell = row.createDiv("gm-time-cell");
+          const matches = activities.filter((activity) => activity.capabilityIds.some((id) => relatedIds.has(id)) && new Date(activity.timestamp).getTime() >= bucket.start && new Date(activity.timestamp).getTime() < bucket.end);
+          if (matches.length) {
+            const hasStage = matches.some((activity) => activity.eventType === "capability-stage-changed");
+            const allRecorded = matches.every((activity) => activity.recorded);
+            const marker = cell.createEl("button", {
+              cls: `gm-time-marker${hasStage ? " is-stage" : ""}${allRecorded ? "" : " is-existing"}`,
+              attr: { "aria-label": matches.length === 1 ? this.activityLabel(matches[0], contents) : `${matches.length} growth activities` }
+            });
+            marker.addEventListener("click", () => void (matches.length === 1 ? this.showTimelineActivity(matches[0], capabilities, contents) : this.showTimelineBucket(matches, capabilities, contents)));
+            if (matches.length > 1) marker.createSpan({ text: `+${matches.length - 1}`, cls: "gm-time-more" });
+          }
+        }
+      }
+    }
+    container.createEl("p", {
+      text: "Recorded Events are shown directly. Earlier content uses its Markdown created date; past stage changes are never inferred.",
+      cls: "gm-timeline-note"
+    });
+    this.sectionTitle(container, "Recent Growth");
+    if (!activities.length) return;
+    const list = container.createDiv("gm-growth-list");
+    let lastDay = "";
+    for (const activity of activities.slice(0, 24)) {
+      const day = new Date(activity.timestamp).toLocaleDateString(void 0, { month: "short", day: "numeric" }).toUpperCase();
+      if (day !== lastDay) {
+        list.createEl("h3", { text: day });
+        lastDay = day;
+      }
+      this.renderGrowthRow(list, activity, capabilities, contents);
+    }
+  }
+  async renderConnections(container, capabilities) {
+    const connections = (await this.plugin.repository.loadConnections()).filter(
+      (item) => (item.strength > 0 || item.pinned) && capabilities.some((capability) => capability.id === item.fromId) && capabilities.some((capability) => capability.id === item.toId)
+    );
+    this.sectionTitle(container, "Emergent Connections", "observed through shared content");
+    if (!connections.length) {
+      this.emptyState(container, "Link one item to two capabilities and their connection will appear here.");
+      return;
+    }
+    const list = container.createDiv("gm-connection-list");
+    for (const connection of connections) {
+      const from = capabilities.find((item) => item.id === connection.fromId);
+      const to = capabilities.find((item) => item.id === connection.toId);
+      const row = list.createEl("button", { cls: "gm-connection-row" });
+      this.applySpectrum(row, from.id, capabilities);
+      const names = row.createDiv();
+      names.createEl("strong", { text: capabilityPath(from.id, capabilities).map((item) => item.name).join(" / ") });
+      names.createSpan({ text: `Related through content \xB7 ${capabilityPath(to.id, capabilities).map((item) => item.name).join(" / ")}` });
+      const strength = row.createDiv("gm-connection-strength");
+      if (connection.pinned) {
+        const pin = strength.createSpan();
+        (0, import_obsidian4.setIcon)(pin, "pin");
+      }
+      strength.createEl("b", { text: String(connection.strength) });
+      strength.createSpan({ text: connection.strength === 1 ? "shared item" : "shared items" });
+      row.addEventListener("click", () => void this.navigate("connection", connectionKey(connection.fromId, connection.toId)));
+    }
+  }
+  async renderConnectionDetail(container) {
+    var _a;
+    const capabilities = (await this.plugin.repository.loadCapabilities()).filter((item) => item.status === "active");
+    const connection = (await this.plugin.repository.loadConnections()).find((item) => connectionKey(item.fromId, item.toId) === this.selectedConnectionKey);
+    if (!connection) {
+      this.mapMode = "connections";
+      await this.navigate("map");
+      return;
+    }
+    const from = capabilities.find((item) => item.id === connection.fromId);
+    const to = capabilities.find((item) => item.id === connection.toId);
+    if (!from || !to) {
+      await this.navigate("map");
+      return;
+    }
+    this.renderPageHeader(container, "Capability Connection", "OBSERVED ASSOCIATION", () => {
+      this.mapMode = "connections";
+      void this.navigate("map");
+    });
+    const pair = container.createDiv("gm-connection-pair");
+    this.applySpectrum(pair, from.id, capabilities);
+    pair.createEl("strong", { text: capabilityPath(from.id, capabilities).map((item) => item.name).join(" / ") });
+    pair.createSpan({ text: "Related through shared content" });
+    pair.createEl("strong", { text: capabilityPath(to.id, capabilities).map((item) => item.name).join(" / ") });
+    const actions = container.createDiv("gm-inline-actions");
+    const pin = actions.createEl("button", { text: connection.pinned ? "Unpin Connection" : "Pin Connection", cls: connection.pinned ? "" : "mod-cta" });
+    pin.addEventListener("click", async () => {
+      await this.plugin.repository.pinConnection(from.id, to.id, !connection.pinned, connection.note);
+      await this.render();
+    });
+    const note = actions.createEl("button", { text: connection.note ? "Edit Note" : "Add Why" });
+    note.addEventListener("click", async () => {
+      var _a2;
+      const value = await promptText(this.app, "Why are they connected?", "Optional note", (_a2 = connection.note) != null ? _a2 : "");
+      if (value === null) return;
+      await this.plugin.repository.pinConnection(from.id, to.id, true, value);
+      await this.render();
+    });
+    if (connection.note) container.createEl("p", { text: connection.note, cls: "gm-connection-note" });
+    const breakdown = container.createDiv("gm-connection-breakdown");
+    for (const type of ["case", "lesson", "knowledge", "hypothesis", "question", "inbox"]) {
+      const count = (_a = connection.counts[type]) != null ? _a : 0;
+      if (count) this.timeSummary(breakdown, String(count), CONTENT_LABELS[type]);
+    }
+    const contents = (await this.plugin.repository.loadContentMetadata()).filter((item) => connection.sharedContentIds.includes(item.id));
+    this.sectionTitle(container, "Shared Content", `${connection.strength} item${connection.strength === 1 ? "" : "s"}`);
+    if (contents.length) this.renderContentCards(container, contents, capabilities);
+    else this.emptyState(container, "This pinned connection has no shared content yet.");
   }
   async renderLibrary(container) {
     const capabilities = await this.plugin.repository.loadCapabilities();
@@ -1587,6 +2167,7 @@ ${item.body}`.toLocaleLowerCase().includes(needle));
     else this.emptyState(container, "No content matches these filters.");
   }
   async renderContent(container) {
+    var _a;
     const capabilities = await this.plugin.repository.loadCapabilities();
     const item = this.selectedContentId ? await this.plugin.repository.loadContent(this.selectedContentId) : null;
     if (!item) {
@@ -1614,6 +2195,7 @@ ${item.body}`.toLocaleLowerCase().includes(needle));
     }
     const preview = container.createDiv("gm-markdown-preview markdown-rendered");
     await import_obsidian4.MarkdownRenderer.render(this.app, item.body, preview, item.file.path, this);
+    await this.renderAttachments(container, (_a = item.attachments) != null ? _a : []);
     const meta = container.createDiv("gm-content-meta");
     meta.createSpan({ text: item.id });
     meta.createSpan({ text: `Updated ${relativeTime(item.updated)}` });
@@ -1673,10 +2255,10 @@ ${item.body}`.toLocaleLowerCase().includes(needle));
     for (const item of [
       { page: "home", label: "Home", icon: "house" },
       { page: "map", label: "Map", icon: "list-tree" },
-      { page: "library", label: "Library", icon: "library" },
-      { page: "ai", label: "AI", icon: "sparkles" }
+      { page: "timeline", label: "Timeline", icon: "history" },
+      { page: "library", label: "Library", icon: "library" }
     ]) {
-      const active = this.page === item.page || item.page === "map" && this.page === "capability" || item.page === "library" && this.page === "content";
+      const active = this.page === item.page || item.page === "map" && (this.page === "capability" || this.page === "connection") || item.page === "library" && this.page === "content";
       const button = nav.createEl("button", { cls: `gm-nav-item${active ? " is-active" : ""}`, attr: { "aria-label": item.label } });
       const icon = button.createSpan();
       (0, import_obsidian4.setIcon)(icon, item.icon);
@@ -1693,8 +2275,8 @@ ${item.body}`.toLocaleLowerCase().includes(needle));
     var _a;
     const capabilities = await this.plugin.repository.loadCapabilities();
     const capability = capabilities.find((item) => item.id === capabilityId);
-    new QuickCaptureModal(this.app, (_a = capability == null ? void 0 : capability.name) != null ? _a : null, async (title, content) => {
-      await this.plugin.repository.createContent({ type: "inbox", title, body: content, capabilityIds: capability ? [capability.id] : [] });
+    new QuickCaptureModal(this.app, (_a = capability == null ? void 0 : capability.name) != null ? _a : null, async (title, content, files) => {
+      await this.plugin.repository.createContent({ type: "inbox", title, body: content, capabilityIds: capability ? [capability.id] : [], attachmentFiles: files });
       this.requestRefresh();
     }).open();
   }
@@ -1942,6 +2524,7 @@ ${item.body}`.toLocaleLowerCase().includes(needle));
     await this.render();
   }
   renderContentCards(container, items, capabilities) {
+    var _a;
     const list = container.createDiv("gm-content-list");
     for (const item of items) {
       const card = list.createEl("button", { cls: "gm-content-card" });
@@ -1950,12 +2533,140 @@ ${item.body}`.toLocaleLowerCase().includes(needle));
       top.createSpan({ text: relativeTime(item.updated), cls: "gm-muted" });
       card.createEl("strong", { text: this.contentTitle(item) });
       const capNames = item.capabilityIds.map((id) => {
-        var _a;
-        return (_a = capabilities.find((entry) => entry.id === id)) == null ? void 0 : _a.name;
+        var _a2;
+        return (_a2 = capabilities.find((entry) => entry.id === id)) == null ? void 0 : _a2.name;
       }).filter(Boolean).slice(0, 3).join(" \xB7 ");
       if (capNames) card.createSpan({ text: capNames, cls: "gm-content-path" });
+      if ((_a = item.attachments) == null ? void 0 : _a.length) {
+        const attachment = card.createSpan({ cls: "gm-attachment-indicator" });
+        (0, import_obsidian4.setIcon)(attachment, "paperclip");
+        attachment.createSpan({ text: String(item.attachments.length) });
+      }
       card.addEventListener("click", () => void this.navigate("content", item.id));
     }
+  }
+  applySpectrum(element, capabilityId, capabilities) {
+    const root = capabilityPath(capabilityId, capabilities)[0];
+    if (root) element.style.setProperty("--gm-spectrum-hue", String(spectrumHue(root.id)));
+  }
+  timeSummary(container, value, label) {
+    const item = container.createDiv("gm-time-summary-item");
+    item.createEl("strong", { text: value });
+    item.createSpan({ text: label });
+  }
+  timelineBuckets(start, activities) {
+    var _a;
+    const now = Date.now();
+    const activityTimes = activities.map((item) => new Date(item.timestamp).getTime()).filter(Number.isFinite);
+    const startTime = (_a = start == null ? void 0 : start.getTime()) != null ? _a : activityTimes.length ? Math.min(...activityTimes) : now - 90 * 864e5;
+    const safeStart = Math.min(startTime, now - 864e5);
+    const bucketCount = 6;
+    const step = Math.max(1, (now + 1 - safeStart) / bucketCount);
+    const shortRange = now - safeStart <= 62 * 864e5;
+    return Array.from({ length: bucketCount }, (_, index) => {
+      const bucketStart = safeStart + step * index;
+      const bucketEnd = index === bucketCount - 1 ? now + 1 : safeStart + step * (index + 1);
+      return {
+        start: bucketStart,
+        end: bucketEnd,
+        label: new Date(bucketStart).toLocaleDateString(void 0, shortRange ? { month: "short", day: "numeric" } : { month: "short" })
+      };
+    });
+  }
+  activityLabel(activity, contents) {
+    var _a, _b, _c, _d, _e, _f;
+    const content = activity.contentId ? contents.find((item) => item.id === activity.contentId) : void 0;
+    if (activity.eventType === "capability-stage-changed") return `Stage ${(_a = activity.fromStage) != null ? _a : "?"} \u2192 ${(_b = activity.toStage) != null ? _b : "?"}`;
+    if (activity.eventType === "focus-added") return "Added to Focus";
+    if (activity.eventType === "focus-removed") return "Removed from Focus";
+    if (activity.eventType === "content-converted") return `Inbox \u2192 ${content ? CONTENT_LABELS[content.type] : String((_d = (_c = activity.metadata) == null ? void 0 : _c.toType) != null ? _d : "Library")}`;
+    const label = content ? CONTENT_LABELS[content.type] : String((_f = (_e = activity.metadata) == null ? void 0 : _e.contentType) != null ? _f : "Content");
+    return activity.recorded ? `New ${label}` : `${label} \xB7 existing created date`;
+  }
+  async showTimelineBucket(activities, capabilities, contents) {
+    const choice = await chooseOption(this.app, "Growth activity", activities.map((activity, index) => ({
+      label: this.activityLabel(activity, contents),
+      value: index,
+      description: activity.capabilityIds.map((id) => capabilityPath(id, capabilities).map((item) => item.name).join(" / ")).filter(Boolean).join(" \xB7 ") || "Unlinked content"
+    })));
+    if (choice !== null) await this.showTimelineActivity(activities[choice], capabilities, contents);
+  }
+  async showTimelineActivity(activity, capabilities, contents) {
+    const path = activity.capabilityIds.map((id) => capabilityPath(id, capabilities).map((item) => item.name).join(" / ")).filter(Boolean).join(" \xB7 ") || "Unlinked content";
+    const options = [{
+      label: path,
+      value: activity.capabilityIds[0] ? `cap:${activity.capabilityIds[0]}` : "close",
+      description: this.activityLabel(activity, contents)
+    }];
+    if (activity.contentId && contents.some((item) => item.id === activity.contentId)) {
+      options.push({ label: "Open related content", value: `content:${activity.contentId}`, description: activity.contentId });
+    }
+    const date = new Date(activity.timestamp).toLocaleDateString(void 0, { year: "numeric", month: "short", day: "numeric" });
+    const choice = await chooseOption(this.app, date, options);
+    if (choice == null ? void 0 : choice.startsWith("cap:")) await this.navigate("capability", choice.slice(4));
+    else if (choice == null ? void 0 : choice.startsWith("content:")) await this.navigate("content", choice.slice(8));
+  }
+  renderGrowthRow(container, activity, capabilities, contents) {
+    const row = container.createEl("button", { cls: "gm-growth-row" });
+    const capabilityId = activity.capabilityIds[0];
+    if (capabilityId) this.applySpectrum(row, capabilityId, capabilities);
+    const marker = row.createSpan({ cls: `gm-growth-dot${activity.eventType === "capability-stage-changed" ? " is-stage" : ""}` });
+    const text = row.createDiv();
+    const path = activity.capabilityIds.map((id) => capabilityPath(id, capabilities).map((item) => item.name).join(" / ")).filter(Boolean).join(" \xB7 ");
+    text.createEl("strong", { text: path || "Unlinked content" });
+    text.createSpan({ text: this.activityLabel(activity, contents) });
+    row.createSpan({ text: new Date(activity.timestamp).toLocaleDateString(void 0, { month: "short", day: "numeric" }), cls: "gm-muted" });
+    marker.setAttribute("aria-hidden", "true");
+    row.addEventListener("click", () => void this.showTimelineActivity(activity, capabilities, contents));
+  }
+  async renderAttachments(container, attachments) {
+    if (!attachments.length) return;
+    this.sectionTitle(container, "Attachments", `${attachments.length}`);
+    const list = container.createDiv("gm-attachment-list");
+    const extra = attachments.length > 3 ? list.createDiv("gm-attachment-extra") : null;
+    attachments.forEach((attachment, index) => {
+      var _a, _b, _c;
+      const parent = index < 3 || !extra ? list : extra;
+      const file = this.app.vault.getAbstractFileByPath(attachment.path);
+      const extension = (_b = (_a = attachment.path.split(".").pop()) == null ? void 0 : _a.toLocaleLowerCase()) != null ? _b : "";
+      const isImage = ((_c = attachment.mimeType) == null ? void 0 : _c.startsWith("image/")) || ["jpg", "jpeg", "png", "webp", "gif"].includes(extension);
+      if (isImage && file instanceof import_obsidian4.TFile) {
+        const figure = parent.createEl("figure", { cls: "gm-attachment-image" });
+        const image = figure.createEl("img", { attr: { src: this.app.vault.getResourcePath(file), alt: attachment.name, loading: "lazy" } });
+        image.addEventListener("click", () => void this.openAttachment(file));
+        figure.createEl("figcaption", { text: attachment.name });
+        return;
+      }
+      const card = parent.createEl("button", { cls: "gm-attachment-card" });
+      const icon = card.createSpan();
+      (0, import_obsidian4.setIcon)(icon, extension === "pdf" ? "file-text" : extension === "doc" || extension === "docx" ? "file-type-2" : "file");
+      const text = card.createDiv();
+      text.createEl("strong", { text: attachment.name });
+      text.createSpan({ text: file instanceof import_obsidian4.TFile ? this.formatBytes(file.stat.size) : attachment.path });
+      card.createSpan({ text: "Open", cls: "gm-attachment-open" });
+      if (file instanceof import_obsidian4.TFile) card.addEventListener("click", () => void this.openAttachment(file));
+      else card.disabled = true;
+    });
+    if (extra) {
+      extra.hidden = true;
+      const show = container.createEl("button", { text: "Show All Attachments", cls: "gm-text-button gm-show-attachments" });
+      show.addEventListener("click", () => {
+        extra.hidden = !extra.hidden;
+        show.setText(extra.hidden ? "Show All Attachments" : "Show Fewer Attachments");
+      });
+    }
+  }
+  async openAttachment(file) {
+    try {
+      await this.app.workspace.getLeaf(true).openFile(file);
+    } catch (e) {
+      new import_obsidian4.Notice("This attachment cannot be previewed on this device. Open it from the Vault to share or export it.");
+    }
+  }
+  formatBytes(bytes) {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   }
   progressBar(container, progress) {
     const track = container.createDiv("gm-progress-track");
@@ -2039,6 +2750,7 @@ var GrowthMapPlugin = class extends import_obsidian5.Plugin {
     this.addCommand({ id: "quick-capture", name: "Quick Capture", callback: () => void this.quickCapture() });
     this.addCommand({ id: "new-capability", name: "New Capability", callback: () => void this.newCapability() });
     this.addCommand({ id: "search", name: "Search", callback: () => void this.openSearch() });
+    this.addCommand({ id: "open-timeline", name: "Open Timeline", callback: () => void this.activateView("timeline") });
     this.addCommand({ id: "open-archive", name: "Open Archive", callback: () => void this.activateView("archive") });
     this.addCommand({ id: "create-checkpoint", name: "Create Checkpoint", callback: () => void this.createCheckpoint() });
     this.addCommand({ id: "restore-last-checkpoint", name: "Restore Last Checkpoint", callback: () => void this.restoreLastCheckpoint() });
@@ -2091,8 +2803,8 @@ var GrowthMapPlugin = class extends import_obsidian5.Plugin {
       activeView.openQuickCapture();
       return;
     }
-    new QuickCaptureModal(this.app, null, async (title, content) => {
-      await this.repository.createContent({ type: "inbox", title, body: content });
+    new QuickCaptureModal(this.app, null, async (title, content, files) => {
+      await this.repository.createContent({ type: "inbox", title, body: content, attachmentFiles: files });
     }).open();
   }
   async newCapability() {

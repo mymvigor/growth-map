@@ -1,5 +1,5 @@
-import { ItemView, MarkdownRenderer, Notice, Platform, WorkspaceLeaf, setIcon } from "obsidian";
-import { capabilityPath, descendantsOf, progressFor, relativeTime } from "./core";
+import { ItemView, MarkdownRenderer, Notice, Platform, TFile, WorkspaceLeaf, setIcon } from "obsidian";
+import { capabilityPath, connectionKey, descendantsOf, progressFor, relativeTime, spectrumHue, timeRangeStart } from "./core";
 import { computeMobileBottomOffset } from "./mobile-layout";
 import {
   CheckpointListModal,
@@ -14,10 +14,13 @@ import type GrowthMapPlugin from "./main";
 import {
   CONTENT_LABELS,
   STAGE_LABELS,
+  type AttachmentRef,
   type Capability,
   type ContentType,
   type LoadedContent,
-  type MainPage
+  type MainPage,
+  type TimeRange,
+  type TimelineActivity
 } from "./types";
 
 export const VIEW_TYPE_GROWTH_MAP = "growth-map-view";
@@ -26,6 +29,9 @@ type LibraryTypeFilter = ContentType | "all";
 
 export class GrowthMapView extends ItemView {
   private page: MainPage = "home";
+  private mapMode: "tree" | "connections" = "tree";
+  private timeRange: TimeRange = "3m";
+  private selectedConnectionKey: string | null = null;
   private selectedCapabilityId: string | null = null;
   private selectedContentId: string | null = null;
   private expanded = new Set<string>();
@@ -99,6 +105,7 @@ export class GrowthMapView extends ItemView {
     this.page = page;
     if (page === "capability") this.selectedCapabilityId = id ?? null;
     if (page === "content") this.selectedContentId = id ?? null;
+    if (page === "connection") this.selectedConnectionKey = id ?? null;
     await this.render();
   }
 
@@ -124,11 +131,13 @@ export class GrowthMapView extends ItemView {
       const scroll = shell.createDiv("gm-scroll");
       if (this.page === "home") await this.renderHome(scroll);
       else if (this.page === "map") await this.renderMap(scroll);
+      else if (this.page === "timeline") await this.renderTimeline(scroll);
       else if (this.page === "library") await this.renderLibrary(scroll);
       else if (this.page === "ai") this.renderAI(scroll);
       else if (this.page === "archive") await this.renderArchive(scroll);
       else if (this.page === "capability") await this.renderCapability(scroll);
       else if (this.page === "content") await this.renderContent(scroll);
+      else if (this.page === "connection") await this.renderConnectionDetail(scroll);
       this.renderFab(shell);
       this.renderNavigation(shell);
       this.scheduleBottomOffsetUpdate();
@@ -253,6 +262,8 @@ export class GrowthMapView extends ItemView {
   private async renderHome(container: HTMLElement): Promise<void> {
     const capabilities = await this.plugin.repository.loadCapabilities();
     const contents = await this.plugin.repository.loadContentMetadata();
+    const monthStart = timeRangeStart("30d") as Date;
+    const monthEvents = await this.plugin.repository.loadGrowthEvents(monthStart);
     const active = capabilities.filter((item) => item.status === "active");
     const roots = active.filter((item) => item.parentId === null).sort((a, b) => a.order - b.order);
     this.renderPageHeader(container, "My Growth", "GROWTH MAP", undefined, { icon: "archive", label: "Open archive", run: () => void this.navigate("archive") });
@@ -268,6 +279,7 @@ export class GrowthMapView extends ItemView {
     for (const root of roots) {
       const progress = progressFor(root.id, active);
       const card = areaGrid.createEl("button", { cls: "gm-area-card" });
+      this.applySpectrum(card, root.id, capabilities);
       const top = card.createDiv("gm-card-top");
       top.createEl("span", { text: root.name });
       top.createEl("strong", { text: `${progress}%` });
@@ -279,6 +291,18 @@ export class GrowthMapView extends ItemView {
     setIcon(addIcon, "plus");
     addArea.createSpan({ text: "Add area" });
     addArea.addEventListener("click", () => void this.addCapability(null));
+
+    const recordedContentIds = new Set(monthEvents.filter((event) => event.eventType === "content-created" && event.contentId).map((event) => event.contentId as string));
+    const legacyNewItems = contents.filter((item) => item.created >= monthStart.toISOString() && !recordedContentIds.has(item.id)).length;
+    const newItems = recordedContentIds.size + legacyNewItems;
+    const stageChanges = monthEvents.filter((event) => event.eventType === "capability-stage-changed").length;
+    const month = container.createEl("button", { cls: "gm-month-card" });
+    const monthText = month.createDiv();
+    monthText.createEl("strong", { text: "This Month" });
+    monthText.createSpan({ text: `${newItems} new item${newItems === 1 ? "" : "s"} · ${stageChanges} stage change${stageChanges === 1 ? "" : "s"}` });
+    const monthArrow = month.createSpan();
+    setIcon(monthArrow, "chevron-right");
+    month.addEventListener("click", () => void this.navigate("timeline"));
 
     const focus = active.filter((item) => item.focus).slice(0, 5);
     this.sectionTitle(container, "Focus", focus.length ? undefined : "Choose up to five capabilities");
@@ -312,7 +336,16 @@ export class GrowthMapView extends ItemView {
 
   private async renderMap(container: HTMLElement): Promise<void> {
     const capabilities = (await this.plugin.repository.loadCapabilities()).filter((item) => item.status === "active");
-    this.renderPageHeader(container, "Capability Map", "MY GROWTH", undefined, { icon: "plus", label: "Add root area", run: () => void this.addCapability(null) });
+    this.renderPageHeader(container, "Growth Map", "MY GROWTH", undefined, { icon: "plus", label: "Add root area", run: () => void this.addCapability(null) });
+    const modes = container.createDiv("gm-segmented");
+    for (const mode of ["tree", "connections"] as const) {
+      const button = modes.createEl("button", { text: mode === "tree" ? "Tree" : "Connections", cls: this.mapMode === mode ? "is-active" : "" });
+      button.addEventListener("click", () => { this.mapMode = mode; void this.render(); });
+    }
+    if (this.mapMode === "connections") {
+      await this.renderConnections(container, capabilities);
+      return;
+    }
     const summary = container.createDiv("gm-map-summary");
     summary.createSpan({ text: "My Growth" });
     summary.createEl("strong", { text: `${progressFor(null, capabilities)}%` });
@@ -332,6 +365,7 @@ export class GrowthMapView extends ItemView {
     const children = this.childrenOf(capability.id, capabilities);
     const row = container.createDiv("gm-tree-row");
     row.style.setProperty("--gm-depth", String(Math.min(depth, 3)));
+    this.applySpectrum(row, capability.id, capabilities);
     const toggle = row.createEl("button", { cls: "gm-tree-toggle", attr: { "aria-label": children.length ? "Expand or collapse" : "No children" } });
     if (children.length) setIcon(toggle, this.expanded.has(capability.id) ? "chevron-down" : "chevron-right");
     else toggle.createSpan({ text: "·" });
@@ -376,6 +410,7 @@ export class GrowthMapView extends ItemView {
     const children = this.childrenOf(capability.id, capabilities);
     const progress = progressFor(capability.id, capabilities);
     const hero = container.createDiv("gm-capability-hero");
+    this.applySpectrum(hero, capability.id, capabilities);
     hero.createEl("strong", { text: `${progress}%`, cls: "gm-progress-number" });
     this.progressBar(hero, progress);
     if (children.length === 0) {
@@ -420,6 +455,35 @@ export class GrowthMapView extends ItemView {
         void this.navigate("library");
       });
     }
+
+    const recentEvents = (await this.plugin.repository.loadGrowthEvents(timeRangeStart("3m"))).filter((event) =>
+      event.capabilityIds.some((id) => relevantIds.has(id))
+    ).slice(0, 3);
+    if (recentEvents.length) {
+      this.sectionTitle(container, "Recent Growth");
+      const growth = container.createDiv("gm-growth-list is-compact");
+      for (const event of recentEvents) this.renderGrowthRow(growth, { ...event, recorded: true }, capabilities, contents);
+    }
+    const connections = (await this.plugin.repository.loadConnections()).filter((item) =>
+      (item.strength > 0 || item.pinned) && (item.fromId === capability.id || item.toId === capability.id)
+    ).slice(0, 5);
+    if (connections.length) {
+      this.sectionTitle(container, "Connected Capabilities");
+      const connectionList = container.createDiv("gm-connected-list");
+      for (const connection of connections) {
+        const otherId = connection.fromId === capability.id ? connection.toId : connection.fromId;
+        const other = capabilities.find((item) => item.id === otherId);
+        if (!other) continue;
+        const row = connectionList.createEl("button", { cls: "gm-connected-row" });
+        this.applySpectrum(row, other.id, capabilities);
+        const text = row.createDiv();
+        text.createEl("strong", { text: other.name });
+        text.createSpan({ text: capabilityPath(other.id, capabilities).slice(0, -1).map((item) => item.name).join(" / ") || "Root area" });
+        row.createEl("b", { text: String(connection.strength) });
+        row.addEventListener("click", () => void this.navigate("connection", connectionKey(connection.fromId, connection.toId)));
+      }
+    }
+
     this.sectionTitle(container, "Recent Content");
     const recent = related.sort((a, b) => b.updated.localeCompare(a.updated)).slice(0, 4);
     if (recent.length) this.renderContentCards(container, recent, capabilities);
@@ -428,6 +492,182 @@ export class GrowthMapView extends ItemView {
     add.addEventListener("click", () => this.openContentForm([capability.id]));
   }
 
+  private async renderTimeline(container: HTMLElement): Promise<void> {
+    const capabilities = (await this.plugin.repository.loadCapabilities()).filter((item) => item.status === "active");
+    const contents = (await this.plugin.repository.loadContentMetadata()).filter((item) => item.status !== "archived");
+    const start = timeRangeStart(this.timeRange);
+    const events = await this.plugin.repository.loadGrowthEvents(start);
+    const recordedContentIds = new Set(events.filter((event) => event.eventType === "content-created" && event.contentId).map((event) => event.contentId as string));
+    const activities: TimelineActivity[] = events.map((event) => ({ ...event, recorded: true }));
+    for (const item of contents) {
+      if ((start && new Date(item.created) < start) || recordedContentIds.has(item.id)) continue;
+      activities.push({
+        timestamp: item.created,
+        eventType: "historical-content",
+        capabilityIds: item.capabilityIds,
+        contentId: item.id,
+        recorded: false,
+        metadata: { contentType: item.type }
+      });
+    }
+    activities.sort((left, right) => right.timestamp.localeCompare(left.timestamp));
+    this.renderPageHeader(container, "Growth Over Time", "TIMELINE");
+    const ranges = container.createDiv("gm-range-chips");
+    for (const range of ["30d", "3m", "6m", "1y", "all"] as const) {
+      const label = range === "all" ? "All" : range.toUpperCase();
+      const button = ranges.createEl("button", { text: label, cls: this.timeRange === range ? "is-active" : "" });
+      button.addEventListener("click", () => { this.timeRange = range; void this.render(); });
+    }
+
+    const last30Start = timeRangeStart("30d") as Date;
+    const last30Events = this.timeRange === "30d" ? events : await this.plugin.repository.loadGrowthEvents(last30Start);
+    const last30Recorded = new Set(last30Events.filter((event) => event.eventType === "content-created" && event.contentId).map((event) => event.contentId as string));
+    const last30Items = last30Recorded.size + contents.filter((item) => item.created >= last30Start.toISOString() && !last30Recorded.has(item.id)).length;
+    const last30Stages = last30Events.filter((event) => event.eventType === "capability-stage-changed").length;
+    const activeCounts = new Map<string, number>();
+    for (const activity of activities.filter((item) => item.timestamp >= last30Start.toISOString())) {
+      for (const id of activity.capabilityIds) {
+        const root = capabilityPath(id, capabilities)[0];
+        if (root) activeCounts.set(root.id, (activeCounts.get(root.id) ?? 0) + 1);
+      }
+    }
+    const mostActiveId = [...activeCounts].sort((left, right) => right[1] - left[1])[0]?.[0];
+    const mostActive = capabilities.find((item) => item.id === mostActiveId)?.name ?? "—";
+    const summary = container.createDiv("gm-time-summary");
+    this.timeSummary(summary, String(last30Items), "new items");
+    this.timeSummary(summary, String(last30Stages), "stage changes");
+    this.timeSummary(summary, mostActive, "most active");
+
+    const roots = capabilities.filter((item) => item.parentId === null).sort((left, right) => left.order - right.order);
+    const focus = capabilities.filter((item) => item.focus && item.parentId !== null);
+    const rows = [...roots, ...focus].filter((item, index, all) => all.findIndex((candidate) => candidate.id === item.id) === index);
+    const buckets = this.timelineBuckets(start, activities);
+    this.sectionTitle(container, "Time Map", "activity · stage change");
+    if (!activities.length) this.emptyState(container, "Changes recorded from v1.1.0 will appear here.");
+    else {
+      const map = container.createDiv("gm-time-map");
+      const header = map.createDiv("gm-time-map-header");
+      header.createSpan();
+      for (const bucket of buckets) header.createSpan({ text: bucket.label });
+      for (const rowCapability of rows) {
+        const row = map.createDiv("gm-time-map-row");
+        this.applySpectrum(row, rowCapability.id, capabilities);
+        const label = row.createEl("button", { text: rowCapability.name, cls: "gm-time-row-label" });
+        label.addEventListener("click", () => void this.navigate("capability", rowCapability.id));
+        const relatedIds = descendantsOf(rowCapability.id, capabilities);
+        relatedIds.add(rowCapability.id);
+        for (const bucket of buckets) {
+          const cell = row.createDiv("gm-time-cell");
+          const matches = activities.filter((activity) => activity.capabilityIds.some((id) => relatedIds.has(id)) && new Date(activity.timestamp).getTime() >= bucket.start && new Date(activity.timestamp).getTime() < bucket.end);
+          if (matches.length) {
+            const hasStage = matches.some((activity) => activity.eventType === "capability-stage-changed");
+            const allRecorded = matches.every((activity) => activity.recorded);
+            const marker = cell.createEl("button", {
+              cls: `gm-time-marker${hasStage ? " is-stage" : ""}${allRecorded ? "" : " is-existing"}`,
+              attr: { "aria-label": matches.length === 1 ? this.activityLabel(matches[0], contents) : `${matches.length} growth activities` }
+            });
+            marker.addEventListener("click", () => void (matches.length === 1
+              ? this.showTimelineActivity(matches[0], capabilities, contents)
+              : this.showTimelineBucket(matches, capabilities, contents)));
+            if (matches.length > 1) marker.createSpan({ text: `+${matches.length - 1}`, cls: "gm-time-more" });
+          }
+        }
+      }
+    }
+    container.createEl("p", {
+      text: "Recorded Events are shown directly. Earlier content uses its Markdown created date; past stage changes are never inferred.",
+      cls: "gm-timeline-note"
+    });
+
+    this.sectionTitle(container, "Recent Growth");
+    if (!activities.length) return;
+    const list = container.createDiv("gm-growth-list");
+    let lastDay = "";
+    for (const activity of activities.slice(0, 24)) {
+      const day = new Date(activity.timestamp).toLocaleDateString(undefined, { month: "short", day: "numeric" }).toUpperCase();
+      if (day !== lastDay) {
+        list.createEl("h3", { text: day });
+        lastDay = day;
+      }
+      this.renderGrowthRow(list, activity, capabilities, contents);
+    }
+  }
+
+  private async renderConnections(container: HTMLElement, capabilities: Capability[]): Promise<void> {
+    const connections = (await this.plugin.repository.loadConnections()).filter((item) =>
+      (item.strength > 0 || item.pinned)
+      && capabilities.some((capability) => capability.id === item.fromId)
+      && capabilities.some((capability) => capability.id === item.toId)
+    );
+    this.sectionTitle(container, "Emergent Connections", "observed through shared content");
+    if (!connections.length) {
+      this.emptyState(container, "Link one item to two capabilities and their connection will appear here.");
+      return;
+    }
+    const list = container.createDiv("gm-connection-list");
+    for (const connection of connections) {
+      const from = capabilities.find((item) => item.id === connection.fromId) as Capability;
+      const to = capabilities.find((item) => item.id === connection.toId) as Capability;
+      const row = list.createEl("button", { cls: "gm-connection-row" });
+      this.applySpectrum(row, from.id, capabilities);
+      const names = row.createDiv();
+      names.createEl("strong", { text: capabilityPath(from.id, capabilities).map((item) => item.name).join(" / ") });
+      names.createSpan({ text: `Related through content · ${capabilityPath(to.id, capabilities).map((item) => item.name).join(" / ")}` });
+      const strength = row.createDiv("gm-connection-strength");
+      if (connection.pinned) {
+        const pin = strength.createSpan();
+        setIcon(pin, "pin");
+      }
+      strength.createEl("b", { text: String(connection.strength) });
+      strength.createSpan({ text: connection.strength === 1 ? "shared item" : "shared items" });
+      row.addEventListener("click", () => void this.navigate("connection", connectionKey(connection.fromId, connection.toId)));
+    }
+  }
+
+  private async renderConnectionDetail(container: HTMLElement): Promise<void> {
+    const capabilities = (await this.plugin.repository.loadCapabilities()).filter((item) => item.status === "active");
+    const connection = (await this.plugin.repository.loadConnections()).find((item) => connectionKey(item.fromId, item.toId) === this.selectedConnectionKey);
+    if (!connection) {
+      this.mapMode = "connections";
+      await this.navigate("map");
+      return;
+    }
+    const from = capabilities.find((item) => item.id === connection.fromId);
+    const to = capabilities.find((item) => item.id === connection.toId);
+    if (!from || !to) {
+      await this.navigate("map");
+      return;
+    }
+    this.renderPageHeader(container, "Capability Connection", "OBSERVED ASSOCIATION", () => { this.mapMode = "connections"; void this.navigate("map"); });
+    const pair = container.createDiv("gm-connection-pair");
+    this.applySpectrum(pair, from.id, capabilities);
+    pair.createEl("strong", { text: capabilityPath(from.id, capabilities).map((item) => item.name).join(" / ") });
+    pair.createSpan({ text: "Related through shared content" });
+    pair.createEl("strong", { text: capabilityPath(to.id, capabilities).map((item) => item.name).join(" / ") });
+    const actions = container.createDiv("gm-inline-actions");
+    const pin = actions.createEl("button", { text: connection.pinned ? "Unpin Connection" : "Pin Connection", cls: connection.pinned ? "" : "mod-cta" });
+    pin.addEventListener("click", async () => {
+      await this.plugin.repository.pinConnection(from.id, to.id, !connection.pinned, connection.note);
+      await this.render();
+    });
+    const note = actions.createEl("button", { text: connection.note ? "Edit Note" : "Add Why" });
+    note.addEventListener("click", async () => {
+      const value = await promptText(this.app, "Why are they connected?", "Optional note", connection.note ?? "");
+      if (value === null) return;
+      await this.plugin.repository.pinConnection(from.id, to.id, true, value);
+      await this.render();
+    });
+    if (connection.note) container.createEl("p", { text: connection.note, cls: "gm-connection-note" });
+    const breakdown = container.createDiv("gm-connection-breakdown");
+    for (const type of ["case", "lesson", "knowledge", "hypothesis", "question", "inbox"] as const) {
+      const count = connection.counts[type] ?? 0;
+      if (count) this.timeSummary(breakdown, String(count), CONTENT_LABELS[type]);
+    }
+    const contents = (await this.plugin.repository.loadContentMetadata()).filter((item) => connection.sharedContentIds.includes(item.id));
+    this.sectionTitle(container, "Shared Content", `${connection.strength} item${connection.strength === 1 ? "" : "s"}`);
+    if (contents.length) this.renderContentCards(container, contents, capabilities);
+    else this.emptyState(container, "This pinned connection has no shared content yet.");
+  }
   private async renderLibrary(container: HTMLElement): Promise<void> {
     const capabilities = await this.plugin.repository.loadCapabilities();
     const contents = await this.plugin.repository.loadContents();
@@ -533,6 +773,7 @@ export class GrowthMapView extends ItemView {
     }
     const preview = container.createDiv("gm-markdown-preview markdown-rendered");
     await MarkdownRenderer.render(this.app, item.body, preview, item.file.path, this);
+    await this.renderAttachments(container, item.attachments ?? []);
     const meta = container.createDiv("gm-content-meta");
     meta.createSpan({ text: item.id });
     meta.createSpan({ text: `Updated ${relativeTime(item.updated)}` });
@@ -595,10 +836,10 @@ export class GrowthMapView extends ItemView {
     for (const item of [
       { page: "home" as const, label: "Home", icon: "house" },
       { page: "map" as const, label: "Map", icon: "list-tree" },
-      { page: "library" as const, label: "Library", icon: "library" },
-      { page: "ai" as const, label: "AI", icon: "sparkles" }
+      { page: "timeline" as const, label: "Timeline", icon: "history" },
+      { page: "library" as const, label: "Library", icon: "library" }
     ]) {
-      const active = this.page === item.page || (item.page === "map" && this.page === "capability") || (item.page === "library" && this.page === "content");
+      const active = this.page === item.page || (item.page === "map" && (this.page === "capability" || this.page === "connection")) || (item.page === "library" && this.page === "content");
       const button = nav.createEl("button", { cls: `gm-nav-item${active ? " is-active" : ""}`, attr: { "aria-label": item.label } });
       const icon = button.createSpan();
       setIcon(icon, item.icon);
@@ -616,8 +857,8 @@ export class GrowthMapView extends ItemView {
   private async launchQuickCapture(capabilityId?: string): Promise<void> {
     const capabilities = await this.plugin.repository.loadCapabilities();
     const capability = capabilities.find((item) => item.id === capabilityId);
-    new QuickCaptureModal(this.app, capability?.name ?? null, async (title, content) => {
-      await this.plugin.repository.createContent({ type: "inbox", title, body: content, capabilityIds: capability ? [capability.id] : [] });
+    new QuickCaptureModal(this.app, capability?.name ?? null, async (title, content, files) => {
+      await this.plugin.repository.createContent({ type: "inbox", title, body: content, capabilityIds: capability ? [capability.id] : [], attachmentFiles: files });
       this.requestRefresh();
     }).open();
   }
@@ -892,10 +1133,143 @@ export class GrowthMapView extends ItemView {
       card.createEl("strong", { text: this.contentTitle(item) });
       const capNames = item.capabilityIds.map((id) => capabilities.find((entry) => entry.id === id)?.name).filter(Boolean).slice(0, 3).join(" · ");
       if (capNames) card.createSpan({ text: capNames, cls: "gm-content-path" });
+      if (item.attachments?.length) {
+        const attachment = card.createSpan({ cls: "gm-attachment-indicator" });
+        setIcon(attachment, "paperclip");
+        attachment.createSpan({ text: String(item.attachments.length) });
+      }
       card.addEventListener("click", () => void this.navigate("content", item.id));
     }
   }
 
+  private applySpectrum(element: HTMLElement, capabilityId: string, capabilities: Capability[]): void {
+    const root = capabilityPath(capabilityId, capabilities)[0];
+    if (root) element.style.setProperty("--gm-spectrum-hue", String(spectrumHue(root.id)));
+  }
+
+  private timeSummary(container: HTMLElement, value: string, label: string): void {
+    const item = container.createDiv("gm-time-summary-item");
+    item.createEl("strong", { text: value });
+    item.createSpan({ text: label });
+  }
+
+  private timelineBuckets(start: Date | null, activities: TimelineActivity[]): Array<{ start: number; end: number; label: string }> {
+    const now = Date.now();
+    const activityTimes = activities.map((item) => new Date(item.timestamp).getTime()).filter(Number.isFinite);
+    const startTime = start?.getTime() ?? (activityTimes.length ? Math.min(...activityTimes) : now - 90 * 86400000);
+    const safeStart = Math.min(startTime, now - 86400000);
+    const bucketCount = 6;
+    const step = Math.max(1, (now + 1 - safeStart) / bucketCount);
+    const shortRange = now - safeStart <= 62 * 86400000;
+    return Array.from({ length: bucketCount }, (_, index) => {
+      const bucketStart = safeStart + step * index;
+      const bucketEnd = index === bucketCount - 1 ? now + 1 : safeStart + step * (index + 1);
+      return {
+        start: bucketStart,
+        end: bucketEnd,
+        label: new Date(bucketStart).toLocaleDateString(undefined, shortRange ? { month: "short", day: "numeric" } : { month: "short" })
+      };
+    });
+  }
+
+  private activityLabel(activity: TimelineActivity, contents: LoadedContent[]): string {
+    const content = activity.contentId ? contents.find((item) => item.id === activity.contentId) : undefined;
+    if (activity.eventType === "capability-stage-changed") return `Stage ${activity.fromStage ?? "?"} → ${activity.toStage ?? "?"}`;
+    if (activity.eventType === "focus-added") return "Added to Focus";
+    if (activity.eventType === "focus-removed") return "Removed from Focus";
+    if (activity.eventType === "content-converted") return `Inbox → ${content ? CONTENT_LABELS[content.type] : String(activity.metadata?.toType ?? "Library")}`;
+    const label = content ? CONTENT_LABELS[content.type] : String(activity.metadata?.contentType ?? "Content");
+    return activity.recorded ? `New ${label}` : `${label} · existing created date`;
+  }
+
+  private async showTimelineBucket(activities: TimelineActivity[], capabilities: Capability[], contents: LoadedContent[]): Promise<void> {
+    const choice = await chooseOption(this.app, "Growth activity", activities.map((activity, index) => ({
+      label: this.activityLabel(activity, contents),
+      value: index,
+      description: activity.capabilityIds.map((id) => capabilityPath(id, capabilities).map((item) => item.name).join(" / ")).filter(Boolean).join(" · ") || "Unlinked content"
+    })));
+    if (choice !== null) await this.showTimelineActivity(activities[choice], capabilities, contents);
+  }
+  private async showTimelineActivity(activity: TimelineActivity, capabilities: Capability[], contents: LoadedContent[]): Promise<void> {
+    const path = activity.capabilityIds.map((id) => capabilityPath(id, capabilities).map((item) => item.name).join(" / ")).filter(Boolean).join(" · ") || "Unlinked content";
+    const options: Array<{ label: string; value: string; description?: string }> = [{
+      label: path,
+      value: activity.capabilityIds[0] ? `cap:${activity.capabilityIds[0]}` : "close",
+      description: this.activityLabel(activity, contents)
+    }];
+    if (activity.contentId && contents.some((item) => item.id === activity.contentId)) {
+      options.push({ label: "Open related content", value: `content:${activity.contentId}`, description: activity.contentId });
+    }
+    const date = new Date(activity.timestamp).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+    const choice = await chooseOption(this.app, date, options);
+    if (choice?.startsWith("cap:")) await this.navigate("capability", choice.slice(4));
+    else if (choice?.startsWith("content:")) await this.navigate("content", choice.slice(8));
+  }
+
+  private renderGrowthRow(container: HTMLElement, activity: TimelineActivity, capabilities: Capability[], contents: LoadedContent[]): void {
+    const row = container.createEl("button", { cls: "gm-growth-row" });
+    const capabilityId = activity.capabilityIds[0];
+    if (capabilityId) this.applySpectrum(row, capabilityId, capabilities);
+    const marker = row.createSpan({ cls: `gm-growth-dot${activity.eventType === "capability-stage-changed" ? " is-stage" : ""}` });
+    const text = row.createDiv();
+    const path = activity.capabilityIds.map((id) => capabilityPath(id, capabilities).map((item) => item.name).join(" / ")).filter(Boolean).join(" · ");
+    text.createEl("strong", { text: path || "Unlinked content" });
+    text.createSpan({ text: this.activityLabel(activity, contents) });
+    row.createSpan({ text: new Date(activity.timestamp).toLocaleDateString(undefined, { month: "short", day: "numeric" }), cls: "gm-muted" });
+    marker.setAttribute("aria-hidden", "true");
+    row.addEventListener("click", () => void this.showTimelineActivity(activity, capabilities, contents));
+  }
+
+  private async renderAttachments(container: HTMLElement, attachments: AttachmentRef[]): Promise<void> {
+    if (!attachments.length) return;
+    this.sectionTitle(container, "Attachments", `${attachments.length}`);
+    const list = container.createDiv("gm-attachment-list");
+    const extra = attachments.length > 3 ? list.createDiv("gm-attachment-extra") : null;
+    attachments.forEach((attachment, index) => {
+      const parent = index < 3 || !extra ? list : extra;
+      const file = this.app.vault.getAbstractFileByPath(attachment.path);
+      const extension = attachment.path.split(".").pop()?.toLocaleLowerCase() ?? "";
+      const isImage = attachment.mimeType?.startsWith("image/") || ["jpg", "jpeg", "png", "webp", "gif"].includes(extension);
+      if (isImage && file instanceof TFile) {
+        const figure = parent.createEl("figure", { cls: "gm-attachment-image" });
+        const image = figure.createEl("img", { attr: { src: this.app.vault.getResourcePath(file), alt: attachment.name, loading: "lazy" } });
+        image.addEventListener("click", () => void this.openAttachment(file));
+        figure.createEl("figcaption", { text: attachment.name });
+        return;
+      }
+      const card = parent.createEl("button", { cls: "gm-attachment-card" });
+      const icon = card.createSpan();
+      setIcon(icon, extension === "pdf" ? "file-text" : extension === "doc" || extension === "docx" ? "file-type-2" : "file");
+      const text = card.createDiv();
+      text.createEl("strong", { text: attachment.name });
+      text.createSpan({ text: file instanceof TFile ? this.formatBytes(file.stat.size) : attachment.path });
+      card.createSpan({ text: "Open", cls: "gm-attachment-open" });
+      if (file instanceof TFile) card.addEventListener("click", () => void this.openAttachment(file));
+      else card.disabled = true;
+    });
+    if (extra) {
+      extra.hidden = true;
+      const show = container.createEl("button", { text: "Show All Attachments", cls: "gm-text-button gm-show-attachments" });
+      show.addEventListener("click", () => {
+        extra.hidden = !extra.hidden;
+        show.setText(extra.hidden ? "Show All Attachments" : "Show Fewer Attachments");
+      });
+    }
+  }
+
+  private async openAttachment(file: TFile): Promise<void> {
+    try {
+      await this.app.workspace.getLeaf(true).openFile(file);
+    } catch {
+      new Notice("This attachment cannot be previewed on this device. Open it from the Vault to share or export it.");
+    }
+  }
+
+  private formatBytes(bytes: number): string {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
   private progressBar(container: HTMLElement, progress: number): void {
     const track = container.createDiv("gm-progress-track");
     const fill = track.createDiv("gm-progress-fill");
