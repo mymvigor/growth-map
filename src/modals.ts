@@ -9,6 +9,7 @@ import {
   updateRecentCapabilityIds,
   type ContentEditorBlock
 } from "./content-ux";
+import { calculateModalViewport, observeModalViewport } from "./mobile-modal";
 import {
   CONFIDENCES,
   CONTENT_LABELS,
@@ -45,40 +46,65 @@ class GrowthModal extends Modal {
     this.modalEl.addClass("gm-modal", ...classes);
     const viewport = window.visualViewport;
     const container = this.modalEl.closest(".modal-container") as HTMLElement | null;
+    let viewportFrame: number | null = null;
+    let focusFrame: number | null = null;
+    let focusTimer: number | null = null;
+    const isInput = (target: HTMLElement): boolean => target.matches("input, textarea, select, [contenteditable=true]");
+    const revealInput = (target: HTMLElement): void => {
+      if (focusFrame !== null) {
+        window.cancelAnimationFrame(focusFrame);
+        focusFrame = null;
+      }
+      if (focusTimer !== null) window.clearTimeout(focusTimer);
+      focusTimer = window.setTimeout(() => {
+        focusTimer = null;
+        focusFrame = window.requestAnimationFrame(() => {
+          focusFrame = null;
+          const scrollRegion = (target.closest(".gm-modal-body") as HTMLElement | null) ?? this.contentEl;
+          const regionRect = scrollRegion.getBoundingClientRect();
+          const targetRect = target.getBoundingClientRect();
+          if (targetRect.top >= regionRect.top + 12 && targetRect.bottom <= regionRect.bottom - 12) return;
+          const regionCenter = regionRect.top + regionRect.height / 2;
+          const targetCenter = targetRect.top + targetRect.height / 2;
+          scrollRegion.scrollBy({ top: targetCenter - regionCenter, behavior: "smooth" });
+        });
+      }, 80);
+    };
     const update = (): void => {
-      const height = viewport?.height ?? window.innerHeight;
-      const top = viewport?.offsetTop ?? 0;
-      this.modalEl.style.setProperty("--gm-visible-viewport-height", `${height}px`);
-      this.modalEl.style.setProperty("--gm-visible-viewport-top", `${top}px`);
+      viewportFrame = null;
+      const metrics = calculateModalViewport(viewport, window.innerHeight);
+      this.modalEl.style.setProperty("--gm-visible-height", `${metrics.visibleHeight}px`);
+      this.modalEl.style.setProperty("--gm-modal-max-height", `${metrics.maxModalHeight}px`);
+      this.modalEl.style.setProperty("--gm-visible-top", `${metrics.offsetTop}px`);
       if (container) {
         container.addClass("gm-modal-viewport");
-        container.style.top = `${top}px`;
-        container.style.height = `${height}px`;
+        container.style.top = `${metrics.offsetTop}px`;
+        container.style.height = `${metrics.visibleHeight}px`;
         container.style.bottom = "auto";
       }
+      const active = document.activeElement;
+      if (active instanceof HTMLElement && this.contentEl.contains(active) && isInput(active)) revealInput(active);
+    };
+    const scheduleUpdate: EventListener = () => {
+      if (viewportFrame !== null) return;
+      viewportFrame = window.requestAnimationFrame(update);
     };
     const focus = (event: FocusEvent): void => {
       const target = event.target;
-      if (!(target instanceof HTMLElement) || !target.matches("input, textarea, select, [contenteditable=true]")) return;
-      window.setTimeout(() => {
-        const top = viewport?.offsetTop ?? 0;
-        const bottom = top + (viewport?.height ?? window.innerHeight) - 76;
-        const rect = target.getBoundingClientRect();
-        if (rect.top < top + 12 || rect.bottom > bottom) target.scrollIntoView({ block: "nearest", behavior: "smooth" });
-      }, 80);
+      if (target instanceof HTMLElement && isInput(target)) revealInput(target);
     };
     update();
-    viewport?.addEventListener("resize", update, { passive: true });
-    viewport?.addEventListener("scroll", update, { passive: true });
-    window.addEventListener("resize", update, { passive: true });
+    const stopObservingViewport = observeModalViewport(viewport, window, scheduleUpdate);
     this.contentEl.addEventListener("focusin", focus);
     this.viewportCleanup = () => {
-      viewport?.removeEventListener("resize", update);
-      viewport?.removeEventListener("scroll", update);
-      window.removeEventListener("resize", update);
+      stopObservingViewport();
       this.contentEl.removeEventListener("focusin", focus);
-      this.modalEl.style.removeProperty("--gm-visible-viewport-height");
-      this.modalEl.style.removeProperty("--gm-visible-viewport-top");
+      if (viewportFrame !== null) window.cancelAnimationFrame(viewportFrame);
+      if (focusFrame !== null) window.cancelAnimationFrame(focusFrame);
+      if (focusTimer !== null) window.clearTimeout(focusTimer);
+      this.modalEl.style.removeProperty("--gm-visible-height");
+      this.modalEl.style.removeProperty("--gm-modal-max-height");
+      this.modalEl.style.removeProperty("--gm-visible-top");
       if (container) {
         container.removeClass("gm-modal-viewport");
         container.style.removeProperty("top");
@@ -108,9 +134,10 @@ class TextPromptModal extends GrowthModal {
   }
 
   onOpen(): void {
-    this.prepareModal();
-    this.contentEl.createEl("h2", { text: this.title });
-    const input = this.contentEl.createEl("input", { cls: "gm-text-input", attr: { type: "text", placeholder: this.placeholder } });
+    this.prepareModal("gm-keyboard-actions-modal");
+    const body = this.contentEl.createDiv("gm-modal-body");
+    body.createEl("h2", { text: this.title });
+    const input = body.createEl("input", { cls: "gm-text-input", attr: { type: "text", placeholder: this.placeholder } });
     input.value = this.initial;
     const submit = (): void => {
       const value = input.value.trim();
@@ -461,13 +488,14 @@ export class QuickCaptureModal extends GrowthModal {
   }
 
   onOpen(): void {
-    this.prepareModal("gm-capture-modal");
-    this.contentEl.createEl("h2", { text: "Record something" });
-    if (this.contextName) this.contentEl.createDiv({ text: `Related to ${this.contextName}`, cls: "gm-context-pill" });
-    const details = this.contentEl.createEl("details", { cls: "gm-optional-title" });
+    this.prepareModal("gm-capture-modal", "gm-keyboard-actions-modal");
+    const body = this.contentEl.createDiv("gm-modal-body");
+    body.createEl("h2", { text: "Record something" });
+    if (this.contextName) body.createDiv({ text: `Related to ${this.contextName}`, cls: "gm-context-pill" });
+    const details = body.createEl("details", { cls: "gm-optional-title" });
     details.createEl("summary", { text: "Add a title (optional)" });
     const title = details.createEl("input", { cls: "gm-text-input", attr: { type: "text", placeholder: "Title" } });
-    const composerHost = this.contentEl.createDiv("gm-composer");
+    const composerHost = body.createDiv("gm-composer");
     this.composer = new ContentComposer(this.app, composerHost, "", []);
     const actions = this.contentEl.createDiv("gm-modal-actions");
     actions.createEl("button", { text: "Cancel" }).addEventListener("click", () => this.close());
@@ -532,10 +560,11 @@ export class ContentFormModal extends GrowthModal {
   }
 
   onOpen(): void {
-    this.prepareModal("gm-content-form-modal");
+    this.prepareModal("gm-content-form-modal", "gm-keyboard-actions-modal");
+    const body = this.contentEl.createDiv("gm-modal-body");
     const initialType = this.initial?.type ?? "knowledge";
-    const heading = this.contentEl.createEl("h2", { text: this.modalTitle(initialType) });
-    const form = this.contentEl.createDiv("gm-form");
+    const heading = body.createEl("h2", { text: this.modalTitle(initialType) });
+    const form = body.createDiv("gm-form");
     const title = this.inputField(form, "Title", "A clear, short title", this.initial?.title ?? "");
     const contentField = form.createDiv("gm-form-field gm-content-field");
     contentField.createEl("label", { text: "Content" });
