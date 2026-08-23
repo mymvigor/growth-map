@@ -1907,8 +1907,9 @@
 .gm-show-attachments {
   margin-top: 6px;
 }
-/* Growth Map 1.1.1 — unified mobile UX */
+/* Growth Map 1.1.2 — keyboard-safe modals */
 .gm-modal-viewport {
+  box-sizing: border-box;
   align-items: flex-start !important;
   justify-content: center;
   padding: var(--gm-space-3, 12px);
@@ -1917,23 +1918,40 @@
 
 .gm-modal {
   width: min(94vw, 520px);
-  max-height: calc(var(--gm-visible-viewport-height, 100dvh) - var(--gm-space-6));
+  max-height: var(--gm-modal-max-height, calc(var(--gm-visible-height, 100dvh) - var(--gm-space-6)));
   margin: auto 0;
   overflow: hidden;
   border-radius: var(--gm-radius-large);
 }
 
 .gm-modal .modal-content {
-  max-height: calc(var(--gm-visible-viewport-height, 100dvh) - var(--gm-space-8));
+  max-height: calc(var(--gm-visible-height, 100dvh) - var(--gm-space-8));
   padding-bottom: 0;
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
 }
 
+.gm-keyboard-actions-modal .modal-content {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.gm-modal-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding-right: 1px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+}
+
 .gm-modal-actions {
   position: sticky;
   z-index: 5;
+  flex: 0 0 auto;
   bottom: 0;
   padding: var(--gm-space-3) 0 max(var(--gm-space-2), env(safe-area-inset-bottom));
   margin-top: var(--gm-space-4);
@@ -2166,7 +2184,7 @@
 }
 
 .gm-capability-picker-modal .modal-content {
-  min-height: min(70vh, 560px, calc(var(--gm-visible-viewport-height, 100dvh) - var(--gm-space-8)));
+  min-height: min(70vh, 560px, calc(var(--gm-visible-height, 100dvh) - var(--gm-space-8)));
 }
 
 .gm-capability-search {
