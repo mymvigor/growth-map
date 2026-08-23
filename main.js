@@ -1954,6 +1954,238 @@ function computeMobileBottomOffset(isMobile, viewportBottom, safeAreaInset, cand
   return Math.ceil(nativeHeight > 0 ? Math.max(nativeHeight, safeInset) + gap : safeInset);
 }
 
+// src/search.ts
+var EMPTY_LIBRARY_SEARCH_FILTERS = Object.freeze({
+  type: "all",
+  area: "all",
+  capability: "all",
+  status: "all",
+  confidence: "all"
+});
+function normalize(value) {
+  return value.toLocaleLowerCase().replace(/\s+/gu, " ").trim();
+}
+function tokenizeSearchQuery(query) {
+  const normalized = normalize(query);
+  if (!normalized) return [];
+  return [...new Set(normalized.split(/\s+/u).filter(Boolean))];
+}
+function markdownToSearchText(markdown) {
+  return markdown.replace(/!\[\[[^\]]+\]\]/gu, " ").replace(/!\[([^\]]*)\]\([^)]*\)/gu, "$1").replace(/\[([^\]]+)\]\([^)]*\)/gu, "$1").replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/gu, "$2").replace(/\[\[([^\]]+)\]\]/gu, "$1").replace(/^\s{0,3}#{1,6}\s+/gmu, "").replace(/^\s{0,3}>\s?/gmu, "").replace(/^\s*[-+*]\s+/gmu, "").replace(/(```|~~~)[^\n]*\n?/gu, "").replace(/[*_~`]+/gu, "").replace(/\s+/gu, " ").trim();
+}
+function attachmentFileName(path) {
+  var _a;
+  return (_a = path.split(/[\\/]/u).pop()) != null ? _a : path;
+}
+function buildSearchDocuments(contents, capabilities) {
+  return contents.map((item) => {
+    var _a;
+    const capabilityPaths = item.capabilityIds.map((id) => capabilityPath(id, [...capabilities]).map((entry) => entry.name).join(" / ")).filter(Boolean);
+    const attachmentNames = [...new Set(((_a = item.attachments) != null ? _a : []).flatMap((attachment) => [
+      attachment.name,
+      attachmentFileName(attachment.path)
+    ]).filter(Boolean))];
+    const body = markdownToSearchText(item.body);
+    return {
+      id: item.id,
+      type: item.type,
+      title: item.title,
+      body,
+      capabilityIds: [...item.capabilityIds],
+      status: item.status,
+      confidence: item.confidence,
+      updated: item.updated,
+      capabilityPaths,
+      attachmentNames,
+      normalizedTitle: normalize(item.title),
+      normalizedBody: normalize(body),
+      normalizedCapability: normalize(capabilityPaths.join("\n")),
+      normalizedAttachment: normalize(attachmentNames.join("\n"))
+    };
+  });
+}
+function countOccurrences(haystack, needle) {
+  if (!needle) return 0;
+  let count = 0;
+  let index = 0;
+  while ((index = haystack.indexOf(needle, index)) >= 0) {
+    count += 1;
+    index += Math.max(needle.length, 1);
+  }
+  return count;
+}
+function bestMatchIndex(text, tokens, phrase) {
+  var _a;
+  const normalized = normalize(text);
+  const phraseIndex = normalized.indexOf(phrase);
+  if (phraseIndex >= 0) return phraseIndex;
+  const candidates = [];
+  for (const token of tokens) {
+    let index = normalized.indexOf(token);
+    while (index >= 0) {
+      candidates.push(index);
+      index = normalized.indexOf(token, index + Math.max(token.length, 1));
+    }
+  }
+  let bestIndex = (_a = candidates[0]) != null ? _a : -1;
+  let bestQuality = -1;
+  for (const index of candidates) {
+    const windowText = normalized.slice(Math.max(0, index - 90), index + 130);
+    const distinctTokens = tokens.filter((token) => windowText.includes(token)).length;
+    const occurrences = tokens.reduce((total, token) => total + countOccurrences(windowText, token), 0);
+    const quality = distinctTokens * 100 + Math.min(occurrences, 20);
+    if (quality > bestQuality || quality === bestQuality && index < bestIndex) {
+      bestIndex = index;
+      bestQuality = quality;
+    }
+  }
+  return bestIndex;
+}
+function createBestSnippet(body, tokens, phrase = tokens.join(" "), maxLength = 200) {
+  var _a, _b;
+  const plain = markdownToSearchText(body);
+  if (!plain) return "";
+  const matchIndex = bestMatchIndex(plain, tokens, phrase);
+  if (matchIndex < 0) {
+    const ending = plain.length > maxLength ? "\u2026" : "";
+    return `${plain.slice(0, maxLength).trim()}${ending}`;
+  }
+  const anchorLength = Math.max(phrase.length, (_b = (_a = tokens[0]) == null ? void 0 : _a.length) != null ? _b : 1);
+  let start = Math.max(0, matchIndex - Math.floor((maxLength - anchorLength) * 0.45));
+  start = Math.min(start, Math.max(0, plain.length - maxLength));
+  const end = Math.min(plain.length, start + maxLength);
+  return `${start > 0 ? "\u2026" : ""}${plain.slice(start, end).trim()}${end < plain.length ? "\u2026" : ""}`;
+}
+function matchingValues(values, tokens) {
+  return values.filter((value) => {
+    const normalized = normalize(value);
+    return tokens.some((token) => normalized.includes(token));
+  });
+}
+function scoreDocument(document2, tokens, phrase) {
+  const titleExact = document2.normalizedTitle === phrase;
+  const titlePhrase = document2.normalizedTitle.includes(phrase);
+  const titleToken = tokens.some((token) => document2.normalizedTitle.includes(token));
+  const bodyPhrase = document2.normalizedBody.includes(phrase);
+  const bodyAllTokens = tokens.every((token) => document2.normalizedBody.includes(token));
+  const bodyToken = tokens.some((token) => document2.normalizedBody.includes(token));
+  const capabilityToken = tokens.some((token) => document2.normalizedCapability.includes(token));
+  let tier = 5e4;
+  if (titleExact) tier = 6e5;
+  else if (titlePhrase) tier = 5e5;
+  else if (titleToken) tier = 4e5;
+  else if (bodyPhrase) tier = 3e5;
+  else if (bodyAllTokens) tier = 25e4;
+  else if (bodyToken) tier = 2e5;
+  else if (capabilityToken) tier = 1e5;
+  const titleMatches = tokens.reduce((total, token) => total + countOccurrences(document2.normalizedTitle, token), 0);
+  const bodyMatches = tokens.reduce((total, token) => total + countOccurrences(document2.normalizedBody, token), 0);
+  const capabilityMatches = tokens.reduce((total, token) => total + countOccurrences(document2.normalizedCapability, token), 0);
+  const attachmentMatches = tokens.reduce((total, token) => total + countOccurrences(document2.normalizedAttachment, token), 0);
+  return tier + Math.min(49999, titleMatches * 1e3 + bodyMatches * 100 + capabilityMatches * 10 + attachmentMatches);
+}
+function searchDocuments(documents, query) {
+  const tokens = tokenizeSearchQuery(query);
+  if (!tokens.length) return [];
+  const phrase = normalize(query);
+  const results = [];
+  for (const document2 of documents) {
+    if (document2.status === "archived") continue;
+    const searchable = [
+      document2.normalizedTitle,
+      document2.normalizedBody,
+      document2.normalizedCapability,
+      document2.normalizedAttachment
+    ].join("\n");
+    if (!tokens.every((token) => searchable.includes(token))) continue;
+    const bodyIndex = bestMatchIndex(document2.body, tokens, phrase);
+    const titleMatches = tokens.some((token) => document2.normalizedTitle.includes(token));
+    const capabilityMatches = matchingValues(document2.capabilityPaths, tokens);
+    const attachmentMatches = matchingValues(document2.attachmentNames, tokens);
+    let source;
+    let snippet;
+    let sourceLabel;
+    let preferredMatch;
+    if (bodyIndex >= 0) {
+      source = "body";
+      snippet = createBestSnippet(document2.body, tokens, phrase);
+      preferredMatch = { source, index: bodyIndex };
+    } else if (titleMatches) {
+      source = "title";
+      snippet = createBestSnippet(document2.body, tokens, phrase);
+      sourceLabel = "Matched in title";
+      preferredMatch = { source };
+    } else if (capabilityMatches.length) {
+      source = "capability";
+      snippet = `Matched in capability: ${capabilityMatches.join(" \xB7 ")}`;
+      sourceLabel = "Matched in capability";
+      preferredMatch = { source, label: capabilityMatches[0] };
+    } else {
+      source = "attachment";
+      snippet = `Attachment: ${attachmentMatches.join(" \xB7 ")}`;
+      sourceLabel = "Matched in attachment";
+      preferredMatch = { source, label: attachmentMatches[0] };
+    }
+    const matchCount = tokens.reduce((total, token) => total + countOccurrences(document2.normalizedTitle, token) + countOccurrences(document2.normalizedBody, token) + countOccurrences(document2.normalizedCapability, token) + countOccurrences(document2.normalizedAttachment, token), 0);
+    results.push({
+      document: document2,
+      score: scoreDocument(document2, tokens, phrase),
+      matchCount,
+      snippet,
+      source,
+      sourceLabel,
+      preferredMatch
+    });
+  }
+  return results.sort((left, right) => right.score - left.score || right.document.updated.localeCompare(left.document.updated) || left.document.id.localeCompare(right.document.id));
+}
+function filterSearchResults(results, filters, capabilities) {
+  let filtered = [...results];
+  if (filters.type !== "all") filtered = filtered.filter((result) => result.document.type === filters.type);
+  if (filters.area !== "all") {
+    const ids = descendantsOf(filters.area, [...capabilities]);
+    ids.add(filters.area);
+    filtered = filtered.filter((result) => result.document.capabilityIds.some((id) => ids.has(id)));
+  }
+  if (filters.capability !== "all") filtered = filtered.filter((result) => result.document.capabilityIds.includes(filters.capability));
+  if (filters.status !== "all") filtered = filtered.filter((result) => result.document.status === filters.status);
+  if (filters.confidence !== "all") filtered = filtered.filter((result) => result.document.confidence === filters.confidence);
+  return filtered;
+}
+function clearLibrarySearchFilters() {
+  return { ...EMPTY_LIBRARY_SEARCH_FILTERS };
+}
+function hasActiveLibrarySearchFilters(filters) {
+  return Object.values(filters).some((value) => value !== "all");
+}
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+function splitHighlightedText(text, tokens) {
+  var _a;
+  const safeTokens = [...new Set(tokens.map((token) => token.trim()).filter(Boolean))].sort((left, right) => right.length - left.length);
+  if (!text || !safeTokens.length) return text ? [{ text, highlighted: false }] : [];
+  const pattern = new RegExp(`(${safeTokens.map(escapeRegExp).join("|")})`, "giu");
+  const segments = [];
+  let lastIndex = 0;
+  for (const match of text.matchAll(pattern)) {
+    const index = (_a = match.index) != null ? _a : 0;
+    if (index > lastIndex) segments.push({ text: text.slice(lastIndex, index), highlighted: false });
+    segments.push({ text: match[0], highlighted: true });
+    lastIndex = index + match[0].length;
+  }
+  if (lastIndex < text.length) segments.push({ text: text.slice(lastIndex), highlighted: false });
+  return segments;
+}
+function createSearchContext(query, contentId, preferredMatch) {
+  return {
+    query: query.trim(),
+    tokens: tokenizeSearchQuery(query),
+    contentId,
+    preferredMatch: preferredMatch ? { ...preferredMatch } : void 0
+  };
+}
+
 // src/timeline.ts
 var DAY = 864e5;
 function startOfDay(date) {
@@ -2103,6 +2335,8 @@ var GrowthMapView = class extends import_obsidian4.ItemView {
     this.libraryCapability = "all";
     this.libraryStatus = "all";
     this.libraryConfidence = "all";
+    this.librarySearchTimer = null;
+    this.contentSearchContext = null;
     this.refreshTimer = null;
     this.initializing = false;
     this.bottomOffsetFrame = null;
@@ -2135,6 +2369,7 @@ var GrowthMapView = class extends import_obsidian4.ItemView {
   async onClose() {
     var _a, _b, _c, _d;
     if (this.refreshTimer !== null) window.clearTimeout(this.refreshTimer);
+    if (this.librarySearchTimer !== null) window.clearTimeout(this.librarySearchTimer);
     if (this.bottomOffsetFrame !== null) window.cancelAnimationFrame(this.bottomOffsetFrame);
     (_a = this.bottomBarResizeObserver) == null ? void 0 : _a.disconnect();
     (_b = this.bottomBarMutationObserver) == null ? void 0 : _b.disconnect();
@@ -2153,10 +2388,15 @@ var GrowthMapView = class extends import_obsidian4.ItemView {
       void this.render();
     }, 250);
   }
-  async navigate(page, id) {
+  async navigate(page, id, searchContext) {
     this.page = page;
     if (page === "capability") this.selectedCapabilityId = id != null ? id : null;
-    if (page === "content") this.selectedContentId = id != null ? id : null;
+    if (page === "content") {
+      this.selectedContentId = id != null ? id : null;
+      this.contentSearchContext = (searchContext == null ? void 0 : searchContext.contentId) === id ? searchContext != null ? searchContext : null : null;
+    } else {
+      this.contentSearchContext = null;
+    }
     if (page === "connection") this.selectedConnectionKey = id != null ? id : null;
     await this.render();
   }
@@ -2711,6 +2951,8 @@ var GrowthMapView = class extends import_obsidian4.ItemView {
   async renderLibrary(container) {
     const capabilities = await this.plugin.repository.loadCapabilities();
     const contents = await this.plugin.repository.loadContents();
+    let searchDocumentCache = null;
+    const searchDocumentSource = () => searchDocumentCache != null ? searchDocumentCache : searchDocumentCache = buildSearchDocuments(contents, capabilities);
     this.renderPageHeader(container, "Library", "YOUR KNOWLEDGE", void 0, { icon: "plus", label: "Add content", run: () => this.openContentForm([]) });
     const inbox = contents.filter((item) => item.type === "inbox" && item.status !== "archived");
     if (inbox.length) {
@@ -2733,12 +2975,22 @@ var GrowthMapView = class extends import_obsidian4.ItemView {
     const search = searchWrap.createEl("input", { cls: "gm-search-input", attr: { type: "search", placeholder: "Search my knowledge\u2026" } });
     search.value = this.librarySearch;
     search.addEventListener("input", () => {
+      const wasEmpty = !this.librarySearch.trim();
       this.librarySearch = search.value;
-      this.updateLibraryResults(container, capabilities, contents);
+      if (wasEmpty && this.librarySearch.trim()) {
+        this.resetLibraryFilters();
+        this.syncLibraryFilterControls(container);
+      }
+      if (this.librarySearchTimer !== null) window.clearTimeout(this.librarySearchTimer);
+      this.librarySearchTimer = window.setTimeout(() => {
+        this.librarySearchTimer = null;
+        this.updateLibraryResults(container, capabilities, contents, searchDocumentSource);
+      }, 150);
     });
     const chips = container.createDiv("gm-chips");
     for (const type of ["all", "knowledge", "case", "lesson", "hypothesis", "question"]) {
       const chip = chips.createEl("button", { text: type === "all" ? "All" : CONTENT_LABELS[type], cls: `gm-chip${this.libraryType === type ? " is-active" : ""}` });
+      chip.dataset.gmType = type;
       chip.addEventListener("click", () => {
         this.libraryType = type;
         void this.render();
@@ -2750,37 +3002,45 @@ var GrowthMapView = class extends import_obsidian4.ItemView {
     this.filterSelect(filterGrid, "Area", this.rootOptions(capabilities), this.libraryArea, (value) => {
       this.libraryArea = value;
       void this.render();
-    });
+    }).dataset.gmFilter = "area";
     this.filterSelect(filterGrid, "Capability", [{ value: "all", label: "All capabilities" }, ...capabilities.filter((item) => item.status === "active").sort((a, b) => a.name.localeCompare(b.name)).map((item) => ({ value: item.id, label: item.name }))], this.libraryCapability, (value) => {
       this.libraryCapability = value;
       void this.render();
-    });
+    }).dataset.gmFilter = "capability";
     this.filterSelect(filterGrid, "Status", ["all", "draft", "validating", "validated", "outdated"].map((value) => ({ value, label: value === "all" ? "All statuses" : value })), this.libraryStatus, (value) => {
       this.libraryStatus = value;
       void this.render();
-    });
+    }).dataset.gmFilter = "status";
     this.filterSelect(filterGrid, "Confidence", ["all", "low", "medium", "high"].map((value) => ({ value, label: value === "all" ? "All confidence" : value })), this.libraryConfidence, (value) => {
       this.libraryConfidence = value;
       void this.render();
-    });
+    }).dataset.gmFilter = "confidence";
     const results = container.createDiv("gm-library-results");
     results.dataset.gmResults = "true";
-    this.renderLibraryResults(results, capabilities, contents);
+    this.renderLibraryResults(results, capabilities, contents, searchDocumentSource);
   }
-  updateLibraryResults(container, capabilities, contents) {
+  updateLibraryResults(container, capabilities, contents, searchDocumentSource) {
     const results = container.querySelector("[data-gm-results]");
     if (!results) return;
     results.empty();
-    this.renderLibraryResults(results, capabilities, contents);
+    this.renderLibraryResults(results, capabilities, contents, searchDocumentSource);
   }
-  renderLibraryResults(container, capabilities, contents) {
+  renderLibraryResults(container, capabilities, contents, searchDocumentSource) {
+    const query = this.librarySearch.trim();
+    if (query) {
+      const allResults = searchDocuments(searchDocumentSource(), query);
+      const filteredResults = filterSearchResults(allResults, this.libraryFilters(), capabilities);
+      const count2 = container.createDiv("gm-result-count");
+      if (hasActiveLibrarySearchFilters(this.libraryFilters())) {
+        count2.setText(`${filteredResults.length} of ${allResults.length} results for "${query}"`);
+      } else count2.setText(`${allResults.length} result${allResults.length === 1 ? "" : "s"} for "${query}"`);
+      this.renderActiveLibraryFilters(container, capabilities);
+      if (filteredResults.length) this.renderSearchResultCards(container, filteredResults, contents, capabilities, query);
+      else this.emptyState(container, "No content matches this search.");
+      return;
+    }
     let filtered = contents.filter((item) => item.status !== "archived");
     if (this.libraryType !== "all") filtered = filtered.filter((item) => item.type === this.libraryType);
-    if (this.librarySearch.trim()) {
-      const needle = this.librarySearch.toLocaleLowerCase();
-      filtered = filtered.filter((item) => `${item.title}
-${item.body}`.toLocaleLowerCase().includes(needle));
-    }
     if (this.libraryArea !== "all") {
       const ids = descendantsOf(this.libraryArea, capabilities);
       ids.add(this.libraryArea);
@@ -2792,10 +3052,155 @@ ${item.body}`.toLocaleLowerCase().includes(needle));
     filtered.sort((a, b) => b.updated.localeCompare(a.updated));
     const count = container.createDiv("gm-result-count");
     count.setText(`${filtered.length} item${filtered.length === 1 ? "" : "s"}`);
+    this.renderActiveLibraryFilters(container, capabilities);
     if (filtered.length) this.renderContentCards(container, filtered, capabilities);
     else this.emptyState(container, "No content matches these filters.");
   }
+  libraryFilters() {
+    return {
+      type: this.libraryType,
+      area: this.libraryArea,
+      capability: this.libraryCapability,
+      status: this.libraryStatus,
+      confidence: this.libraryConfidence
+    };
+  }
+  resetLibraryFilters() {
+    const cleared = clearLibrarySearchFilters();
+    this.libraryType = cleared.type;
+    this.libraryArea = cleared.area;
+    this.libraryCapability = cleared.capability;
+    this.libraryStatus = cleared.status;
+    this.libraryConfidence = cleared.confidence;
+  }
+  syncLibraryFilterControls(container) {
+    for (const chip of Array.from(container.querySelectorAll("[data-gm-type]"))) {
+      chip.classList.toggle("is-active", chip.dataset.gmType === this.libraryType);
+    }
+    for (const select of Array.from(container.querySelectorAll("[data-gm-filter]"))) {
+      const key = select.dataset.gmFilter;
+      if (key === "area") select.value = this.libraryArea;
+      else if (key === "capability") select.value = this.libraryCapability;
+      else if (key === "status") select.value = this.libraryStatus;
+      else if (key === "confidence") select.value = this.libraryConfidence;
+    }
+  }
+  renderActiveLibraryFilters(container, capabilities) {
+    var _a, _b;
+    if (!hasActiveLibrarySearchFilters(this.libraryFilters())) return;
+    const row = container.createDiv("gm-active-filters");
+    row.createSpan({ text: "Filtered by:", cls: "gm-active-filters-label" });
+    const entries = [];
+    if (this.libraryType !== "all") entries.push({ key: "type", label: CONTENT_LABELS[this.libraryType] });
+    if (this.libraryArea !== "all") {
+      entries.push({ key: "area", label: (_b = (_a = capabilities.find((item) => item.id === this.libraryArea)) == null ? void 0 : _a.name) != null ? _b : this.libraryArea });
+    }
+    if (this.libraryCapability !== "all") {
+      const path = capabilityPath(this.libraryCapability, capabilities).map((item) => item.name).join(" / ");
+      entries.push({ key: "capability", label: path || this.libraryCapability });
+    }
+    if (this.libraryStatus !== "all") entries.push({ key: "status", label: this.libraryStatus });
+    if (this.libraryConfidence !== "all") entries.push({ key: "confidence", label: this.libraryConfidence });
+    for (const entry of entries) {
+      const chip = row.createEl("button", { text: `${entry.label} \xD7`, cls: "gm-active-filter" });
+      chip.addEventListener("click", () => {
+        if (entry.key === "type") this.libraryType = "all";
+        else if (entry.key === "area") this.libraryArea = "all";
+        else if (entry.key === "capability") this.libraryCapability = "all";
+        else if (entry.key === "status") this.libraryStatus = "all";
+        else this.libraryConfidence = "all";
+        void this.render();
+      });
+    }
+    const clear = row.createEl("button", { text: "Clear filters", cls: "gm-clear-filters" });
+    clear.addEventListener("click", () => {
+      this.resetLibraryFilters();
+      void this.render();
+    });
+  }
+  renderSearchResultCards(container, results, contents, capabilities, query) {
+    var _a;
+    const tokens = createSearchContext(query, "").tokens;
+    const list = container.createDiv("gm-content-list gm-search-results");
+    for (const result of results) {
+      const item = contents.find((content) => content.id === result.document.id);
+      if (!item) continue;
+      const card = list.createEl("button", { cls: "gm-content-card gm-search-result" });
+      const top = card.createDiv("gm-content-card-top");
+      top.createSpan({ text: CONTENT_LABELS[item.type].toUpperCase(), cls: `gm-type gm-type-${item.type}` });
+      top.createSpan({ text: relativeTime(item.updated), cls: "gm-muted" });
+      const title = card.createEl("strong");
+      this.renderHighlightedText(title, this.contentTitle(item), tokens);
+      if (result.snippet) {
+        const snippet = card.createEl("p", { cls: "gm-search-snippet" });
+        this.renderHighlightedText(snippet, result.snippet, tokens);
+      }
+      const paths = item.capabilityIds.map((id) => capabilityPath(id, capabilities).map((entry) => entry.name).join(" / ")).filter(Boolean).slice(0, 2);
+      if (paths.length) card.createSpan({ text: `Related to \xB7 ${paths.join(" \xB7 ")}`, cls: "gm-content-path" });
+      const matchMeta = card.createDiv("gm-search-match-meta");
+      if (result.sourceLabel) matchMeta.createSpan({ text: result.sourceLabel });
+      matchMeta.createSpan({ text: `${result.matchCount} match${result.matchCount === 1 ? "" : "es"}` });
+      if ((_a = item.attachments) == null ? void 0 : _a.length) {
+        const attachment = matchMeta.createSpan({ cls: "gm-attachment-indicator" });
+        (0, import_obsidian4.setIcon)(attachment, "paperclip");
+        attachment.createSpan({ text: String(item.attachments.length) });
+      }
+      card.addEventListener("click", () => {
+        const context = createSearchContext(query, item.id, result.preferredMatch);
+        void this.navigate("content", item.id, context);
+      });
+    }
+  }
+  renderHighlightedText(container, text, tokens) {
+    for (const segment of splitHighlightedText(text, tokens)) {
+      if (!segment.highlighted) container.appendChild(container.ownerDocument.createTextNode(segment.text));
+      else container.createSpan({ text: segment.text, cls: "gm-search-highlight" });
+    }
+  }
+  applyContentSearchContext(preview, related, context) {
+    var _a, _b, _c;
+    const previewMatches = this.highlightRenderedSearchText(preview, context.tokens);
+    let target = (_a = previewMatches[0]) != null ? _a : null;
+    if (((_b = context.preferredMatch) == null ? void 0 : _b.source) === "capability" && related) {
+      const relatedMatches = this.highlightRenderedSearchText(related, context.tokens);
+      target = (_c = relatedMatches[0]) != null ? _c : related;
+    }
+    if (!target) return;
+    window.requestAnimationFrame(() => target == null ? void 0 : target.scrollIntoView({ block: "center" }));
+  }
+  highlightRenderedSearchText(root, tokens) {
+    var _a;
+    const documentRef = root.ownerDocument;
+    const walker = documentRef.createTreeWalker(root, 4);
+    const textNodes = [];
+    let current = walker.nextNode();
+    while (current) {
+      const textNode = current;
+      const parent = textNode.parentElement;
+      if (textNode.data && parent && !parent.closest("code, pre, script, style, .gm-search-highlight")) textNodes.push(textNode);
+      current = walker.nextNode();
+    }
+    const highlights = [];
+    for (const textNode of textNodes) {
+      const segments = splitHighlightedText(textNode.data, tokens);
+      if (!segments.some((segment) => segment.highlighted)) continue;
+      const fragment = documentRef.createDocumentFragment();
+      for (const segment of segments) {
+        if (!segment.highlighted) fragment.appendChild(documentRef.createTextNode(segment.text));
+        else {
+          const mark = documentRef.createElement("span");
+          mark.className = "gm-search-highlight";
+          mark.textContent = segment.text;
+          fragment.appendChild(mark);
+          highlights.push(mark);
+        }
+      }
+      (_a = textNode.parentNode) == null ? void 0 : _a.replaceChild(fragment, textNode);
+    }
+    return highlights;
+  }
   async renderContent(container) {
+    var _a;
     const capabilities = await this.plugin.repository.loadCapabilities();
     const item = this.selectedContentId ? await this.plugin.repository.loadContent(this.selectedContentId) : null;
     if (!item) {
@@ -2803,6 +3208,7 @@ ${item.body}`.toLocaleLowerCase().includes(needle));
       await this.render();
       return;
     }
+    const searchContext = ((_a = this.contentSearchContext) == null ? void 0 : _a.contentId) === item.id ? this.contentSearchContext : null;
     this.renderPageHeader(container, this.contentTitle(item), CONTENT_LABELS[item.type].toUpperCase(), () => void this.navigate("library"), {
       icon: "ellipsis",
       label: "Content actions",
@@ -2814,8 +3220,9 @@ ${item.body}`.toLocaleLowerCase().includes(needle));
     badges.createSpan({ text: item.sourceType });
     const preview = container.createDiv("gm-markdown-preview");
     await this.renderContentBody(preview, item);
+    let related = null;
     if (item.capabilityIds.length) {
-      const related = container.createDiv("gm-content-related");
+      related = container.createDiv("gm-content-related");
       related.createEl("h2", { text: "Related to" });
       const links = related.createDiv("gm-content-capabilities");
       for (const id of item.capabilityIds) {
@@ -2834,6 +3241,7 @@ ${item.body}`.toLocaleLowerCase().includes(needle));
     }
     const open = container.createEl("button", { text: "Open Markdown", cls: "gm-secondary-button" });
     open.addEventListener("click", () => void this.app.workspace.getLeaf(false).openFile(item.file));
+    if (searchContext) this.applyContentSearchContext(preview, related, searchContext);
   }
   renderAI(container) {
     this.renderPageHeader(container, "AI Assistant", "OPTIONAL");
@@ -3343,6 +3751,7 @@ ${item.body}`.toLocaleLowerCase().includes(needle));
       element.selected = selected === option.value;
     }
     select.addEventListener("change", () => onChange(select.value));
+    return select;
   }
   rootOptions(capabilities) {
     return [{ value: "all", label: "All areas" }, ...capabilities.filter((item) => item.status === "active" && item.parentId === null).sort((a, b) => a.order - b.order).map((item) => ({ value: item.id, label: item.name }))];

@@ -2,6 +2,19 @@ import { ItemView, MarkdownRenderer, Notice, Platform, TFile, WorkspaceLeaf, set
 import { capabilityPath, connectionKey, descendantsOf, progressFor, relativeTime, spectrumHue, timeRangeStart } from "./core";
 import { parseContentBlocks, updateRecentCapabilityIds } from "./content-ux";
 import { computeMobileBottomOffset } from "./mobile-layout";
+import {
+  buildSearchDocuments,
+  clearLibrarySearchFilters,
+  createSearchContext,
+  filterSearchResults,
+  hasActiveLibrarySearchFilters,
+  searchDocuments,
+  splitHighlightedText,
+  type LibrarySearchFilters,
+  type SearchContext,
+  type SearchDocument,
+  type SearchResult
+} from "./search";
 import { naturalTimelineBuckets, timelineBucketIndex, timelineRangeStart } from "./timeline";
 import {
   CheckpointListModal,
@@ -52,6 +65,8 @@ export class GrowthMapView extends ItemView {
   private libraryCapability = "all";
   private libraryStatus = "all";
   private libraryConfidence = "all";
+  private librarySearchTimer: number | null = null;
+  private contentSearchContext: SearchContext | null = null;
   private refreshTimer: number | null = null;
   private initializing = false;
   private bottomOffsetFrame: number | null = null;
@@ -91,6 +106,7 @@ export class GrowthMapView extends ItemView {
 
   async onClose(): Promise<void> {
     if (this.refreshTimer !== null) window.clearTimeout(this.refreshTimer);
+    if (this.librarySearchTimer !== null) window.clearTimeout(this.librarySearchTimer);
     if (this.bottomOffsetFrame !== null) window.cancelAnimationFrame(this.bottomOffsetFrame);
     this.bottomBarResizeObserver?.disconnect();
     this.bottomBarMutationObserver?.disconnect();
@@ -111,10 +127,15 @@ export class GrowthMapView extends ItemView {
     }, 250);
   }
 
-  async navigate(page: MainPage, id?: string): Promise<void> {
+  async navigate(page: MainPage, id?: string, searchContext?: SearchContext): Promise<void> {
     this.page = page;
     if (page === "capability") this.selectedCapabilityId = id ?? null;
-    if (page === "content") this.selectedContentId = id ?? null;
+    if (page === "content") {
+      this.selectedContentId = id ?? null;
+      this.contentSearchContext = searchContext?.contentId === id ? searchContext ?? null : null;
+    } else {
+      this.contentSearchContext = null;
+    }
     if (page === "connection") this.selectedConnectionKey = id ?? null;
     await this.render();
   }
@@ -692,6 +713,8 @@ export class GrowthMapView extends ItemView {
   private async renderLibrary(container: HTMLElement): Promise<void> {
     const capabilities = await this.plugin.repository.loadCapabilities();
     const contents = await this.plugin.repository.loadContents();
+    let searchDocumentCache: SearchDocument[] | null = null;
+    const searchDocumentSource = (): SearchDocument[] => searchDocumentCache ??= buildSearchDocuments(contents, capabilities);
     this.renderPageHeader(container, "Library", "YOUR KNOWLEDGE", undefined, { icon: "plus", label: "Add content", run: () => this.openContentForm([]) });
     const inbox = contents.filter((item) => item.type === "inbox" && item.status !== "archived");
     if (inbox.length) {
@@ -714,12 +737,22 @@ export class GrowthMapView extends ItemView {
     const search = searchWrap.createEl("input", { cls: "gm-search-input", attr: { type: "search", placeholder: "Search my knowledge…" } });
     search.value = this.librarySearch;
     search.addEventListener("input", () => {
+      const wasEmpty = !this.librarySearch.trim();
       this.librarySearch = search.value;
-      this.updateLibraryResults(container, capabilities, contents);
+      if (wasEmpty && this.librarySearch.trim()) {
+        this.resetLibraryFilters();
+        this.syncLibraryFilterControls(container);
+      }
+      if (this.librarySearchTimer !== null) window.clearTimeout(this.librarySearchTimer);
+      this.librarySearchTimer = window.setTimeout(() => {
+        this.librarySearchTimer = null;
+        this.updateLibraryResults(container, capabilities, contents, searchDocumentSource);
+      }, 150);
     });
     const chips = container.createDiv("gm-chips");
     for (const type of ["all", "knowledge", "case", "lesson", "hypothesis", "question"] as const) {
       const chip = chips.createEl("button", { text: type === "all" ? "All" : CONTENT_LABELS[type], cls: `gm-chip${this.libraryType === type ? " is-active" : ""}` });
+      chip.dataset.gmType = type;
       chip.addEventListener("click", () => {
         this.libraryType = type;
         void this.render();
@@ -728,29 +761,38 @@ export class GrowthMapView extends ItemView {
     const filters = container.createEl("details", { cls: "gm-filters" });
     filters.createEl("summary", { text: "Filters" });
     const filterGrid = filters.createDiv("gm-filter-grid");
-    this.filterSelect(filterGrid, "Area", this.rootOptions(capabilities), this.libraryArea, (value) => { this.libraryArea = value; void this.render(); });
-    this.filterSelect(filterGrid, "Capability", [{ value: "all", label: "All capabilities" }, ...capabilities.filter((item) => item.status === "active").sort((a, b) => a.name.localeCompare(b.name)).map((item) => ({ value: item.id, label: item.name }))], this.libraryCapability, (value) => { this.libraryCapability = value; void this.render(); });
-    this.filterSelect(filterGrid, "Status", ["all", "draft", "validating", "validated", "outdated"].map((value) => ({ value, label: value === "all" ? "All statuses" : value })), this.libraryStatus, (value) => { this.libraryStatus = value; void this.render(); });
-    this.filterSelect(filterGrid, "Confidence", ["all", "low", "medium", "high"].map((value) => ({ value, label: value === "all" ? "All confidence" : value })), this.libraryConfidence, (value) => { this.libraryConfidence = value; void this.render(); });
+    this.filterSelect(filterGrid, "Area", this.rootOptions(capabilities), this.libraryArea, (value) => { this.libraryArea = value; void this.render(); }).dataset.gmFilter = "area";
+    this.filterSelect(filterGrid, "Capability", [{ value: "all", label: "All capabilities" }, ...capabilities.filter((item) => item.status === "active").sort((a, b) => a.name.localeCompare(b.name)).map((item) => ({ value: item.id, label: item.name }))], this.libraryCapability, (value) => { this.libraryCapability = value; void this.render(); }).dataset.gmFilter = "capability";
+    this.filterSelect(filterGrid, "Status", ["all", "draft", "validating", "validated", "outdated"].map((value) => ({ value, label: value === "all" ? "All statuses" : value })), this.libraryStatus, (value) => { this.libraryStatus = value; void this.render(); }).dataset.gmFilter = "status";
+    this.filterSelect(filterGrid, "Confidence", ["all", "low", "medium", "high"].map((value) => ({ value, label: value === "all" ? "All confidence" : value })), this.libraryConfidence, (value) => { this.libraryConfidence = value; void this.render(); }).dataset.gmFilter = "confidence";
     const results = container.createDiv("gm-library-results");
     results.dataset.gmResults = "true";
-    this.renderLibraryResults(results, capabilities, contents);
+    this.renderLibraryResults(results, capabilities, contents, searchDocumentSource);
   }
 
-  private updateLibraryResults(container: HTMLElement, capabilities: Capability[], contents: LoadedContent[]): void {
+  private updateLibraryResults(container: HTMLElement, capabilities: Capability[], contents: LoadedContent[], searchDocumentSource: () => SearchDocument[]): void {
     const results = container.querySelector<HTMLElement>("[data-gm-results]");
     if (!results) return;
     results.empty();
-    this.renderLibraryResults(results, capabilities, contents);
+    this.renderLibraryResults(results, capabilities, contents, searchDocumentSource);
   }
 
-  private renderLibraryResults(container: HTMLElement, capabilities: Capability[], contents: LoadedContent[]): void {
+  private renderLibraryResults(container: HTMLElement, capabilities: Capability[], contents: LoadedContent[], searchDocumentSource: () => SearchDocument[]): void {
+    const query = this.librarySearch.trim();
+    if (query) {
+      const allResults = searchDocuments(searchDocumentSource(), query);
+      const filteredResults = filterSearchResults(allResults, this.libraryFilters(), capabilities);
+      const count = container.createDiv("gm-result-count");
+      if (hasActiveLibrarySearchFilters(this.libraryFilters())) {
+        count.setText(`${filteredResults.length} of ${allResults.length} results for "${query}"`);
+      } else count.setText(`${allResults.length} result${allResults.length === 1 ? "" : "s"} for "${query}"`);
+      this.renderActiveLibraryFilters(container, capabilities);
+      if (filteredResults.length) this.renderSearchResultCards(container, filteredResults, contents, capabilities, query);
+      else this.emptyState(container, "No content matches this search.");
+      return;
+    }
     let filtered = contents.filter((item) => item.status !== "archived");
     if (this.libraryType !== "all") filtered = filtered.filter((item) => item.type === this.libraryType);
-    if (this.librarySearch.trim()) {
-      const needle = this.librarySearch.toLocaleLowerCase();
-      filtered = filtered.filter((item) => `${item.title}\n${item.body}`.toLocaleLowerCase().includes(needle));
-    }
     if (this.libraryArea !== "all") {
       const ids = descendantsOf(this.libraryArea, capabilities);
       ids.add(this.libraryArea);
@@ -762,10 +804,166 @@ export class GrowthMapView extends ItemView {
     filtered.sort((a, b) => b.updated.localeCompare(a.updated));
     const count = container.createDiv("gm-result-count");
     count.setText(`${filtered.length} item${filtered.length === 1 ? "" : "s"}`);
+    this.renderActiveLibraryFilters(container, capabilities);
     if (filtered.length) this.renderContentCards(container, filtered, capabilities);
     else this.emptyState(container, "No content matches these filters.");
   }
 
+  private libraryFilters(): LibrarySearchFilters {
+    return {
+      type: this.libraryType,
+      area: this.libraryArea,
+      capability: this.libraryCapability,
+      status: this.libraryStatus,
+      confidence: this.libraryConfidence
+    };
+  }
+
+  private resetLibraryFilters(): void {
+    const cleared = clearLibrarySearchFilters();
+    this.libraryType = cleared.type;
+    this.libraryArea = cleared.area;
+    this.libraryCapability = cleared.capability;
+    this.libraryStatus = cleared.status;
+    this.libraryConfidence = cleared.confidence;
+  }
+
+  private syncLibraryFilterControls(container: HTMLElement): void {
+    for (const chip of Array.from(container.querySelectorAll<HTMLElement>("[data-gm-type]"))) {
+      chip.classList.toggle("is-active", chip.dataset.gmType === this.libraryType);
+    }
+    for (const select of Array.from(container.querySelectorAll<HTMLSelectElement>("[data-gm-filter]"))) {
+      const key = select.dataset.gmFilter;
+      if (key === "area") select.value = this.libraryArea;
+      else if (key === "capability") select.value = this.libraryCapability;
+      else if (key === "status") select.value = this.libraryStatus;
+      else if (key === "confidence") select.value = this.libraryConfidence;
+    }
+  }
+
+  private renderActiveLibraryFilters(container: HTMLElement, capabilities: Capability[]): void {
+    if (!hasActiveLibrarySearchFilters(this.libraryFilters())) return;
+    const row = container.createDiv("gm-active-filters");
+    row.createSpan({ text: "Filtered by:", cls: "gm-active-filters-label" });
+    const entries: Array<{ key: keyof LibrarySearchFilters; label: string }> = [];
+    if (this.libraryType !== "all") entries.push({ key: "type", label: CONTENT_LABELS[this.libraryType] });
+    if (this.libraryArea !== "all") {
+      entries.push({ key: "area", label: capabilities.find((item) => item.id === this.libraryArea)?.name ?? this.libraryArea });
+    }
+    if (this.libraryCapability !== "all") {
+      const path = capabilityPath(this.libraryCapability, capabilities).map((item) => item.name).join(" / ");
+      entries.push({ key: "capability", label: path || this.libraryCapability });
+    }
+    if (this.libraryStatus !== "all") entries.push({ key: "status", label: this.libraryStatus });
+    if (this.libraryConfidence !== "all") entries.push({ key: "confidence", label: this.libraryConfidence });
+    for (const entry of entries) {
+      const chip = row.createEl("button", { text: `${entry.label} \u00d7`, cls: "gm-active-filter" });
+      chip.addEventListener("click", () => {
+        if (entry.key === "type") this.libraryType = "all";
+        else if (entry.key === "area") this.libraryArea = "all";
+        else if (entry.key === "capability") this.libraryCapability = "all";
+        else if (entry.key === "status") this.libraryStatus = "all";
+        else this.libraryConfidence = "all";
+        void this.render();
+      });
+    }
+    const clear = row.createEl("button", { text: "Clear filters", cls: "gm-clear-filters" });
+    clear.addEventListener("click", () => {
+      this.resetLibraryFilters();
+      void this.render();
+    });
+  }
+
+  private renderSearchResultCards(
+    container: HTMLElement,
+    results: SearchResult[],
+    contents: LoadedContent[],
+    capabilities: Capability[],
+    query: string
+  ): void {
+    const tokens = createSearchContext(query, "").tokens;
+    const list = container.createDiv("gm-content-list gm-search-results");
+    for (const result of results) {
+      const item = contents.find((content) => content.id === result.document.id);
+      if (!item) continue;
+      const card = list.createEl("button", { cls: "gm-content-card gm-search-result" });
+      const top = card.createDiv("gm-content-card-top");
+      top.createSpan({ text: CONTENT_LABELS[item.type].toUpperCase(), cls: `gm-type gm-type-${item.type}` });
+      top.createSpan({ text: relativeTime(item.updated), cls: "gm-muted" });
+      const title = card.createEl("strong");
+      this.renderHighlightedText(title, this.contentTitle(item), tokens);
+      if (result.snippet) {
+        const snippet = card.createEl("p", { cls: "gm-search-snippet" });
+        this.renderHighlightedText(snippet, result.snippet, tokens);
+      }
+      const paths = item.capabilityIds
+        .map((id) => capabilityPath(id, capabilities).map((entry) => entry.name).join(" / "))
+        .filter(Boolean)
+        .slice(0, 2);
+      if (paths.length) card.createSpan({ text: `Related to \u00b7 ${paths.join(" \u00b7 ")}`, cls: "gm-content-path" });
+      const matchMeta = card.createDiv("gm-search-match-meta");
+      if (result.sourceLabel) matchMeta.createSpan({ text: result.sourceLabel });
+      matchMeta.createSpan({ text: `${result.matchCount} match${result.matchCount === 1 ? "" : "es"}` });
+      if (item.attachments?.length) {
+        const attachment = matchMeta.createSpan({ cls: "gm-attachment-indicator" });
+        setIcon(attachment, "paperclip");
+        attachment.createSpan({ text: String(item.attachments.length) });
+      }
+      card.addEventListener("click", () => {
+        const context = createSearchContext(query, item.id, result.preferredMatch);
+        void this.navigate("content", item.id, context);
+      });
+    }
+  }
+
+  private renderHighlightedText(container: HTMLElement, text: string, tokens: readonly string[]): void {
+    for (const segment of splitHighlightedText(text, tokens)) {
+      if (!segment.highlighted) container.appendChild(container.ownerDocument.createTextNode(segment.text));
+      else container.createSpan({ text: segment.text, cls: "gm-search-highlight" });
+    }
+  }
+  private applyContentSearchContext(preview: HTMLElement, related: HTMLElement | null, context: SearchContext): void {
+    const previewMatches = this.highlightRenderedSearchText(preview, context.tokens);
+    let target = previewMatches[0] ?? null;
+    if (context.preferredMatch?.source === "capability" && related) {
+      const relatedMatches = this.highlightRenderedSearchText(related, context.tokens);
+      target = relatedMatches[0] ?? related;
+    }
+    if (!target) return;
+    window.requestAnimationFrame(() => target?.scrollIntoView({ block: "center" }));
+  }
+
+  private highlightRenderedSearchText(root: HTMLElement, tokens: readonly string[]): HTMLElement[] {
+    const documentRef = root.ownerDocument;
+    const walker = documentRef.createTreeWalker(root, 4);
+    const textNodes: Text[] = [];
+    let current = walker.nextNode();
+    while (current) {
+      const textNode = current as Text;
+      const parent = textNode.parentElement;
+      if (textNode.data && parent && !parent.closest("code, pre, script, style, .gm-search-highlight")) textNodes.push(textNode);
+      current = walker.nextNode();
+    }
+
+    const highlights: HTMLElement[] = [];
+    for (const textNode of textNodes) {
+      const segments = splitHighlightedText(textNode.data, tokens);
+      if (!segments.some((segment) => segment.highlighted)) continue;
+      const fragment = documentRef.createDocumentFragment();
+      for (const segment of segments) {
+        if (!segment.highlighted) fragment.appendChild(documentRef.createTextNode(segment.text));
+        else {
+          const mark = documentRef.createElement("span");
+          mark.className = "gm-search-highlight";
+          mark.textContent = segment.text;
+          fragment.appendChild(mark);
+          highlights.push(mark);
+        }
+      }
+      textNode.parentNode?.replaceChild(fragment, textNode);
+    }
+    return highlights;
+  }
   private async renderContent(container: HTMLElement): Promise<void> {
     const capabilities = await this.plugin.repository.loadCapabilities();
     const item = this.selectedContentId ? await this.plugin.repository.loadContent(this.selectedContentId) : null;
@@ -774,6 +972,7 @@ export class GrowthMapView extends ItemView {
       await this.render();
       return;
     }
+    const searchContext = this.contentSearchContext?.contentId === item.id ? this.contentSearchContext : null;
     this.renderPageHeader(container, this.contentTitle(item), CONTENT_LABELS[item.type].toUpperCase(), () => void this.navigate("library"), {
       icon: "ellipsis",
       label: "Content actions",
@@ -785,8 +984,9 @@ export class GrowthMapView extends ItemView {
     badges.createSpan({ text: item.sourceType });
     const preview = container.createDiv("gm-markdown-preview");
     await this.renderContentBody(preview, item);
+    let related: HTMLElement | null = null;
     if (item.capabilityIds.length) {
-      const related = container.createDiv("gm-content-related");
+      related = container.createDiv("gm-content-related");
       related.createEl("h2", { text: "Related to" });
       const links = related.createDiv("gm-content-capabilities");
       for (const id of item.capabilityIds) {
@@ -805,6 +1005,7 @@ export class GrowthMapView extends ItemView {
     }
     const open = container.createEl("button", { text: "Open Markdown", cls: "gm-secondary-button" });
     open.addEventListener("click", () => void this.app.workspace.getLeaf(false).openFile(item.file));
+    if (searchContext) this.applyContentSearchContext(preview, related, searchContext);
   }
 
   private renderAI(container: HTMLElement): void {
@@ -1340,7 +1541,7 @@ export class GrowthMapView extends ItemView {
     card.createSpan({ text: "Coming later" });
   }
 
-  private filterSelect(container: HTMLElement, label: string, options: Array<{ value: string; label: string }>, selected: string, onChange: (value: string) => void): void {
+  private filterSelect(container: HTMLElement, label: string, options: Array<{ value: string; label: string }>, selected: string, onChange: (value: string) => void): HTMLSelectElement {
     const field = container.createDiv("gm-filter-field");
     field.createEl("label", { text: label });
     const select = field.createEl("select", { cls: "dropdown" });
@@ -1349,6 +1550,7 @@ export class GrowthMapView extends ItemView {
       element.selected = selected === option.value;
     }
     select.addEventListener("change", () => onChange(select.value));
+    return select;
   }
 
   private rootOptions(capabilities: Capability[]): Array<{ value: string; label: string }> {
